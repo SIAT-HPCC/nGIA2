@@ -1,55 +1,55 @@
 /*
   timer.h
-  chrono库实现的计时器 支持时间戳 中断计时
-  用法如下
-  TImer timer;  // 声明
+  chrono库实现的计时器 支持时间戳 中断计时 用法如下
+  Timer::Timer timer;  // 声明
   timer.getTimeNow();  // 打时间戳
   timer.start();  // 开始计时
   timer.pause();  // 暂停计时
   timer.resume();  // 恢复计时
   timer.getDuration();  // 统计耗时
-  2022/02/13 by 鞠震
+  2024/03/09 by 鞠震
 */
 
 #include <iostream>  // cout
 #include <chrono>  // system_clock
-#include <ctime>  // time_t
 #ifndef __TIMERH__  // 防御声明 pragma once 通用性有问题
 #define __TIMERH__
 //--------类声明--------//
 namespace Timer {  // 命名空间
 class Timer {  // 计时器
   private:
-    std::chrono::system_clock::time_point now;  // 当前时间
-    std::time_t time_now;  // 时间戳的格式化版
-    std::chrono::steady_clock::time_point t1;  // 计时开始时刻
-    std::chrono::steady_clock::time_point t2;  // 计时结束时刻
-    std::chrono::duration<double> duration;  // 耗时
-    bool p;  // 是否暂停了
+    std::chrono::steady_clock::time_point stamp;  // 时间戳
+    std::chrono::duration<double> duration;  // 耗时 秒
+    bool running;  // 正在计时
   public:
+    Timer() {  // 构造
+      stamp = std::chrono::steady_clock::now();
+      duration = std::chrono::duration<double>(0);
+      running = true;
+    }
+    ~Timer() {}  // 析构
     void getTimeNow() {  // 输出当前时间戳
-      now = std::chrono::system_clock::now();
-      time_now = std::chrono::system_clock::to_time_t(now);
-      std::cout << ctime(&time_now);
+      auto now = std::chrono::system_clock::now();
+      auto time_t = std::chrono::system_clock::to_time_t(now);
+      std::cout << ctime(&time_t);
     }
     void start() {  // 开始计时
-      t1 = std::chrono::steady_clock::now();
+      stamp = std::chrono::steady_clock::now();
       duration = std::chrono::duration<double>(0);
-      p = false;  // 不暂停
+      running = true;
     }
     void pause() {  // 暂停计时
-      t2 = std::chrono::steady_clock::now();
-      duration += std::chrono::duration_cast
-        <std::chrono::duration<double>>(t2-t1);
-      p = true;
+      duration += std::chrono::steady_clock::now()-stamp;
+      running = false;
     }
     void resume() {  // 恢复计时
-      t1 = std::chrono::steady_clock::now();
-      p = false;
+      stamp = std::chrono::steady_clock::now();
+      running = true;
     }
     void getDuration() {  // 输出耗时
-      if (!p) pause();  // 没暂停需要先暂停
-      std::cout << duration.count() << " seconds.\n";
+      auto duration_cast = duration;
+      if (running) duration_cast += std::chrono::steady_clock::now()-stamp;
+      std::cout << duration_cast.count() << " s\n";
     }
 };
 }
