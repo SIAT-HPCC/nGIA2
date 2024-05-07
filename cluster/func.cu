@@ -1,10 +1,13 @@
 // func.cu
 // Endian:little 默认小端
+// 很多优化看起来冗余 不提升性能 是为减少不可预期的编译行为 让性能稳定 让耗时无波动
 #include <iostream>  // cout
 #include <fstream>  // fstream
 #include <vector>  // vector
 #include "parser.h"  // 解析器
 #include "func.h"  // 数据结构与函数
+
+__constant__ uint32_t represent[10242];  // 代表序列 常量内存 约40KB
 
 // init 初始化 ok
 void init(int argc, char **argv, Option &option) {
@@ -25,15 +28,28 @@ void init(int argc, char **argv, Option &option) {
       exit(0);
     }
     packedFile.close();
-    if (option.identity < 1 || option.identity > 99) {  // 数据类型不对
+    if (option.identity < 1 || option.identity > 99) {  // 数据范围不对
       std::cout << "identity should be 1-99\n";
       exit(0);
     }
+  }
+  cudaDeviceProp prop;  // 显卡属性
+  int32_t count = 0;  // 显卡个数
+  {  // 配置显卡
+    if (cudaGetDeviceCount(&count)!=cudaSuccess || count==0) {
+      std::cout << "find no GPU\n";
+      exit(0);
+    }
+    cudaGetDeviceProperties(&prop, 0);  // 获取属性
+    cudaSetDevice(0);
+    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);  // 共享内存变缓存
+    cudaDeviceSynchronize();  // 激活GPU
   }
   // 打印信息
   std::cout << "packed:\t\t" << option.packedFile << "\n";
   std::cout << "result:\t\t" << option.resultFile << "\n";
   std::cout << "identity:\t" << option.identity << "\n";
+  std::cout << "use GPU:\t" << prop.name << " (1/" << count << ")\n";
 }
 
 // k32 32*32的计算核心
@@ -69,10 +85,10 @@ uint32_t *carrys, uint32_t *line) {
 template<int32_t entropy>
 __global__ void kernel_dynamic(uint32_t *reads, size_t *offsets,
 uint32_t *remains, int32_t remainCount, uint32_t *cluster, float threshold) {
-  int32_t index = blockDim.x*blockIdx.x+threadIdx.x;  // 线程编号
-  if (index+1 >= remainCount) return;  // 超出范围
-  uint32_t *represent = &reads[offsets[remains[0]]];  // 代表序列起始位置
-  uint32_t *read = &reads[offsets[remains[index+1]]];  // 任务序列起始位置
+  int32_t index = blockDim.x*blockIdx.x+threadIdx.x+1;  // 线程编号
+  if (index >= remainCount) return;  // 超出范围
+  // uint32_t *represent = &reads[offsets[remains[0]]];  // 代表序列起始位置
+  uint32_t *read = &reads[offsets[remains[index]]];  // 任务序列起始位置
   uint32_t length1 = represent[0];  // 代表序列长度
   uint32_t length2 = read[0];  // 剩余序列长度
   uint32_t netLength1 = represent[1];  // 代表序列净长度
@@ -82,13 +98,20 @@ uint32_t *remains, int32_t remainCount, uint32_t *cluster, float threshold) {
   memset(line, 0xFF, (netLength1+31)/32*sizeof(uint32_t));  // 0:匹配 1:不匹配
   uint32_t Rows[entropy] = {0};  // 从行取的32个碱基/氨基酸
   uint32_t Cols[entropy] = {0};  // 从列取的32个碱基/氨基酸
+  uint32_t RowsPre[entropy] = {0};  // 从行取的32个碱基/氨基酸
+  uint32_t ColsPre[entropy] = {0};  // 从列取的32个碱基/氨基酸
+
 
   // 计算
+  for (int32_t e=0; e<entropy; e++) ColsPre[e] = read[2+e];
   for (int32_t i=0; i<netLength2; i+=32) {  // 遍历列
     uint32_t carrys = 0;  // 进位
-    for (int32_t e=0; e<entropy; e++) Cols[e] = read[2+i/32*entropy+e];
+    for (int32_t e=0; e<entropy; e++) Cols[e] = ColsPre[e];
+    for (int32_t e=0; e<entropy; e++) ColsPre[e] = read[2+(i/32+1)*entropy+e];
+    for (int32_t e=0; e<entropy; e++) RowsPre[e] = represent[2+e];
     for (int32_t j=0; j<netLength1; j+=32) {  // 遍历行
-      for (int32_t e=0; e<entropy; e++) Rows[e] = represent[2+j/32*entropy+e];
+      for (int32_t e=0; e<entropy; e++) Rows[e] = RowsPre[e];
+      for (int32_t e=0; e<entropy; e++) RowsPre[e] = represent[2+(j/32+1)*entropy+e];
       k32<entropy>(Rows, Cols, &carrys, &line[j/32]);
     }
   }
@@ -100,8 +123,8 @@ uint32_t *remains, int32_t remainCount, uint32_t *cluster, float threshold) {
     }
     int32_t cutoff = ceil((float)length2*threshold);
     if (sum >= cutoff) {
-      cluster[remains[index+1]] = remains[0];
-      remains[index+1] = 0xFFFFFFFF;  // 已经聚类了
+      cluster[remains[index]] = remains[0];
+      remains[index] = 0xFFFFFFFF;  // 已经聚类了
     }
   }
 }
@@ -117,13 +140,17 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
     packedFile.read((char*)&entropy, sizeof(int32_t));  // 读序列类型
     packedFile.read((char*)&readsCount, sizeof(int32_t));  // 读序列数
     cudaMallocManaged(&offsets, sizeof(size_t)*(readsCount+1));  // 序列偏移
+    cudaMemAdvise(offsets, sizeof(size_t)*(readsCount+1),
+      cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
     packedFile.read((char*)offsets, sizeof(size_t)*(readsCount+1));  // 序列偏移
     cudaMallocManaged(&reads, offsets[readsCount]-offsets[0]);  // 打包数据
+    cudaMemAdvise(reads, offsets[readsCount]-offsets[0],
+      cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
     packedFile.seekg(offsets[0], std::ios::beg);  // 移位
     packedFile.read((char*)reads, offsets[readsCount]-offsets[0]);  // 打包数据
     packedFile.close();  // 读文件完成
     size_t position = sizeof(int32_t)*2+sizeof(size_t)*readsCount*2;
-    for (int32_t i=0; i<readsCount; i++) {  // 字节位置转为uint32_t位移
+    for (int32_t i=0; i<readsCount; i++) {  // 字节位置转为uint32_t偏移
       offsets[i] = (offsets[i]-position)/sizeof(uint32_t);
     }
     if (entropy == 3) {  // 基因
@@ -147,24 +174,34 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
     }
     int32_t remainCount = readsCount;  // 剩余序列数
     while (remainCount > 0) {  // 直到剩余序列为0
-      if (entropy == 3) {  // 基因 32*8=256
+      // 准备代表序列
+      std::cout << "\r" << remains[0] << "/" << readsCount << std::flush;
+      int32_t repOff = offsets[remains[0]];
+      size_t length = ((reads[repOff]+31)/32*entropy+2)*sizeof(uint32_t);
+      cudaMemcpyToSymbol(represent, &reads[repOff], length);
+      // 序列比对
+      if (entropy == 3) {  // 基因
         kernel_dynamic<3><<<(remainCount+255)/256, 256>>>
           (reads, offsets, remains, remainCount, cluster, threshold);
-      } else {  // 蛋白 32*8=256
+      } else {  // 蛋白
         kernel_dynamic<5><<<(remainCount+255)/256, 256>>>
           (reads, offsets, remains, remainCount, cluster, threshold);
       }
-      cudaDeviceSynchronize();
-      int32_t j = 0;
-      for (int32_t i=1; i<remainCount; i++) {  // 更新剩余序列
-        if (remains[i] != 0xFFFFFFFF) {  // 还没聚类
-          remains[j] = remains[i];
-          j += 1;
+      // 计算剩余任务
+      cudaMemPrefetchAsync(remains, sizeof(uint32_t)*remainCount,
+        cudaCpuDeviceId, 0);  // toHost
+      cudaStreamSynchronize(0);  // 等数据传输完成
+      int32_t count = 0;
+      for (int32_t i=1; i<remainCount; i++) {  // 计算剩余的序列
+        if (remains[i] != 0xFFFFFFFF) {
+          remains[count] = remains[i];
+          count += 1;
         }
       }
-      remainCount = j;
-      std::cout << "\r" << remains[0] << "/" << readsCount << std::flush;
+      remainCount = count;  // 剩余序列数就是任务数
+      cudaMemPrefetchAsync(remains, sizeof(uint32_t)*remainCount, 0);
     }
+    cudaDeviceSynchronize();  // 整体退出
     std::cout << "\r" << readsCount << "/" << readsCount << "\n";
   }
   {  // 统计类个数
@@ -193,3 +230,6 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
 // 常量内存
 // 显存内计算remains
 // 少量序列用batch
+
+// gene   : 90 9392 22.8242s
+// protein: 80 5399 11.8318s
