@@ -39,7 +39,7 @@ void init(int argc, char **argv, Option &option) {
 // k32 32*32的计算核心
 template<int32_t entropy>
 __device__ inline void k32(const uint32_t *Rows, const uint32_t *Cols,
-uint32_t *carrys, uint32_t *line, const int32_t colCount) {
+uint32_t *carrys, uint32_t *line) {
   uint32_t matchs[1<<entropy] = {0};  // 匹配碱基/氨基酸 寄存器 1匹配 0不匹配
   {  // 预生成match
     for (int32_t i=0; i<1<<entropy; i++) {
@@ -49,7 +49,7 @@ uint32_t *carrys, uint32_t *line, const int32_t colCount) {
     }
   }
   uint32_t row = *line;  // 上一行结果
-  for (int32_t k=0; k<colCount; k++) {  // 32*32的核心
+  for (int32_t k=0; k<32; k++) {  // 32*32的核心
     int32_t order = 0;
     for (int32_t e=0; e<entropy; e++) order += (Cols[e]>>k&1)<<e;
     uint32_t match = matchs[order];  // 匹配上的碱基/氨基酸
@@ -82,40 +82,21 @@ uint32_t *remains, int32_t remainCount, uint32_t *cluster, float threshold) {
   memset(line, 0xFF, (netLength1+31)/32*sizeof(uint32_t));  // 0:匹配 1:不匹配
   uint32_t Rows[entropy] = {0};  // 从行取的32个碱基/氨基酸
   uint32_t Cols[entropy] = {0};  // 从列取的32个碱基/氨基酸
-  int32_t lshift = (length2-ceil(length2*threshold)+31)/32;  // 左偏移
-  int32_t rshift = (length1-ceil(length2*threshold)+31)/32;  // 右偏移
 
   // 计算
-  for (int32_t i=0; i<netLength2/32*32; i+=32) {  // 遍历列
-    int32_t colCount = 32;  // 列向剩余
+  for (int32_t i=0; i<netLength2; i+=32) {  // 遍历列
     uint32_t carrys = 0;  // 进位
     for (int32_t e=0; e<entropy; e++) Cols[e] = read[2+i/32*entropy+e];
-    int32_t jstart = max(i/32-lshift, 0);
-    int32_t jend = min(i/32+rshift, (netLength1+31)/32-1);
-    for (int32_t j=jstart; j<=jend; j++) {  // 遍历行
-      for (int32_t e=0; e<entropy; e++) Rows[e] = represent[2+j*entropy+e];
-      k32<entropy>(Rows, Cols, &carrys, &line[j], colCount);
-    }
-  }
-  for (int32_t i=netLength2/32*32; i<netLength2; i+=32) {  // 补齐
-    int32_t colCount = netLength2-i;  // 列向剩余
-    uint32_t carrys = 0;  // 进位
-    for (int32_t e=0; e<entropy; e++) Cols[e] = read[2+i/32*entropy+e];
-    int32_t jstart = max(i/32-lshift, 0);
-    int32_t jend = min(i/32+rshift, (netLength1+31)/32-1);
-    for (int32_t j=jstart; j<=jend; j++) {  // 遍历行
-      for (int32_t e=0; e<entropy; e++) Rows[e] = represent[2+j*entropy+e];
-      k32<entropy>(Rows, Cols, &carrys, &line[j], colCount);
+    for (int32_t j=0; j<netLength1; j+=32) {  // 遍历行
+      for (int32_t e=0; e<entropy; e++) Rows[e] = represent[2+j/32*entropy+e];
+      k32<entropy>(Rows, Cols, &carrys, &line[j/32]);
     }
   }
   {  // 统计结果
     int32_t sum = 0;
-    for (int32_t i=0; i<netLength1/32*32; i+=32) {
-      sum += 32 - __popc(line[i/32]);
-    }
-    if (netLength1%32 != 0) {
-      uint32_t mask = (1<<netLength1%32)-1;
-      sum += netLength1%32 - __popc(line[netLength1/32]&mask);
+    for (int32_t i=0; i<netLength1; i+=32) sum += 32-__popc(line[i/32]);
+    if (netLength1%32!=0 && netLength2%32!=0) {
+      sum -= 32-max(netLength1%32, netLength2%32);
     }
     int32_t cutoff = ceil((float)length2*threshold);
     if (sum >= cutoff) {
@@ -145,7 +126,7 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
     for (int32_t i=0; i<readsCount; i++) {  // 字节位置转为uint32_t位移
       offsets[i] = (offsets[i]-position)/sizeof(uint32_t);
     }
-    if (entropy == 2) {  // 基因
+    if (entropy == 3) {  // 基因
       std::cout << "data type:\tgene" << "\n";
     } else {  // 蛋白
       std::cout << "data type:\tprotein" << "\n";
@@ -166,8 +147,8 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
     }
     int32_t remainCount = readsCount;  // 剩余序列数
     while (remainCount > 0) {  // 直到剩余序列为0
-      if (entropy == 2) {  // 基因 32*8=256
-        kernel_dynamic<2><<<(remainCount+255)/256, 256>>>
+      if (entropy == 3) {  // 基因 32*8=256
+        kernel_dynamic<3><<<(remainCount+255)/256, 256>>>
           (reads, offsets, remains, remainCount, cluster, threshold);
       } else {  // 蛋白 32*8=256
         kernel_dynamic<5><<<(remainCount+255)/256, 256>>>
