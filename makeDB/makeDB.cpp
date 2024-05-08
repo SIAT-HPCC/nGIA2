@@ -34,7 +34,7 @@ makeDB -f fasta文件 -p packed文件 -t (0:基因 1:蛋白序)
 struct Option {  // 输入选项
   std::string fastaFile;  // fasta文件
   std::string packedFile;  // packed文件
-  int32_t entropy;  // 数据的熵 基因2 蛋白5
+  int32_t entropy;  // 数据的熵 基因3 蛋白5
 };
 
 struct Read {  // 记录一条序列的位置 为了排序
@@ -68,17 +68,15 @@ void parse(int argc, char **argv, Option &option) {
       if (line.back() == '\r') line.pop_back();  // 去除\r
       for (char a:line) count += a=='a'||a=='A'||a=='c'||a=='C'||a=='g'||
         a=='G'||a=='t'||a=='T'||a=='u'||a=='U'||a=='n'||a=='N'||a=='-'?1:0;
-      option.entropy = count>line.size()*0.9?3:5;  // gene:2 protein:5
+      if (count >= line.size()*0.9f) option.entropy = 3;  // 基因
+      if (count < line.size()*0.9f) option.entropy = 5;  // 蛋白
     }
     fastaFile.close();
   }
   std::cout << "fasta:\t" << option.fastaFile << "\n";
   std::cout << "packed:\t" << option.packedFile << "\n";
-  if (option.entropy == 3) {  // 基因
-    std::cout << "type:\tgene\n";
-  } else {  // 蛋白
-    std::cout << "type:\tprotein\n";
-  }
+  if (option.entropy == 3) std::cout << "type:\tgene\n";  // 基因
+  if (option.entropy == 5) std::cout << "type:\tprotein\n";  // 蛋白
 }
 
 // makeIndex 文件索引
@@ -115,11 +113,11 @@ void makeIndex(const Option &option, std::vector<Read> &reads) {
   std::cout << "short:\t" << reads.back().readLength << "\n";
 }
 
-const std::unordered_map<char, uint32_t> transTableGen = {  // 基因转码表
+std::unordered_map<char, uint32_t> transTableGen = {  // 基因转码表
   {'a',1}, {'c',2}, {'g',3}, {'t',4}, {'u',4},
   {'A',1}, {'C',2}, {'G',3}, {'T',4}, {'U',4}
 };  // 只用于makeData函数
-const std::unordered_map<char, uint32_t> transTablePro = {  // 蛋白转码表
+std::unordered_map<char, uint32_t> transTablePro = {  // 蛋白转码表
   {'a', 1}, {'c', 2}, {'d', 3}, {'e', 4}, {'f', 5}, {'g', 6}, {'h', 7},
   {'A', 1}, {'C', 2}, {'D', 3}, {'E', 4}, {'F', 5}, {'G', 6}, {'H', 7},
   {'i', 8}, {'k', 9}, {'l',10}, {'m',11}, {'n',12}, {'o',13}, {'p',14},
@@ -131,17 +129,15 @@ const std::unordered_map<char, uint32_t> transTablePro = {  // 蛋白转码表
 };  // 只用于makeData函数
 
 // makeData 生成数据 acgt -> 1010 1100
-template <int32_t entropy>  // 基因熵3 蛋白熵5
+template <int32_t entropy, std::unordered_map<char, uint32_t> &transTable>
 void makeData(const std::string &read, std::vector<uint32_t> &buffer) {
   buffer.assign(2+(read.size()+31)/32*entropy, 0);  // 初始化
   uint32_t packs[entropy] = {0};  // 打包后数据 编译会展开成寄存器
   uint32_t *packed = buffer.data()+2;  // 打包后数据存储位置
   uint32_t netLength = 0;  // 净长度
-  const std::unordered_map<char, uint32_t> *transTable;  // 转码表
-  transTable = entropy==3?&transTableGen:&transTablePro;
   for (auto base:read) {
-    auto iterator = (*transTable).find(base);  // 查找结果
-    if (iterator == (*transTable).end()) continue;  // 未知碱基/氨基酸
+    auto iterator = transTable.find(base);  // 查找结果
+    if (iterator == transTable.end()) continue;  // 未知碱基/氨基酸
     uint32_t pack = iterator->second;  // 编码
     for (int32_t e=0; e<entropy; e++) packs[e] >>= 1;
     for (int32_t e=0; e<entropy; e++) packs[e] += (pack>>e&1)<<31;
@@ -204,11 +200,8 @@ void makeDB(const Option &option, std::vector<Read> &reads) {
         if (line.back() == '\r') line.pop_back();  // 去除\r
         read += line;
       }
-      if (option.entropy == 3) {  // 基因序列
-        makeData<3>(read, buffer);
-      } else {  // 蛋白序列
-        makeData<5>(read, buffer);
-      }
+      if (option.entropy == 3) makeData<3, transTableGen>(read, buffer);  // gen
+      if (option.entropy == 5) makeData<5, transTablePro>(read, buffer);  // pro
       name += '\n';
       read += '\n';
       packedFile.seekp(packedOffsets[i], std::ios::beg);  // 移到packed文件起始

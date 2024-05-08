@@ -3,9 +3,11 @@
 
 int main(int argc, char **argv) {
   Timer::Timer timer;  // 计时
+  timer.getTimeNow();  // 时间戳
   Option option;  // 输入参数
   init(argc, argv, option);  // 读输入 初始化显卡
   std::vector<int32_t> result;
   clustering(option, result);  // 聚类
   timer.getDuration();  // 耗时
+  timer.getTimeNow();  // 时间戳
 }

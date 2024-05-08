@@ -7,8 +7,6 @@
 #include "parser.h"  // 解析器
 #include "func.h"  // 数据结构与函数
 
-__constant__ uint32_t represent[10242];  // 代表序列 常量内存 约40KB
-
 // init 初始化 ok
 void init(int argc, char **argv, Option &option) {
   {  // 解析命令行
@@ -52,77 +50,66 @@ void init(int argc, char **argv, Option &option) {
   std::cout << "use GPU:\t" << prop.name << " (1/" << count << ")\n";
 }
 
-// k32 32*32的计算核心
-template<int32_t entropy>
-__device__ inline void k32(const uint32_t *Rows, const uint32_t *Cols,
-uint32_t *carrys, uint32_t *line) {
-  uint32_t matchs[1<<entropy] = {0};  // 匹配碱基/氨基酸 寄存器 1匹配 0不匹配
-  {  // 预生成match
-    for (int32_t i=0; i<1<<entropy; i++) {
-      uint32_t match = 0xFFFFFFFF;
-      for (int32_t e=0; e<entropy; e++) match &= Rows[e]^0xFFFFFFFF+(i>>e&1);
-      matchs[i] = match;
-    }
-  }
-  uint32_t row = *line;  // 上一行结果
-  for (int32_t k=0; k<32; k++) {  // 32*32的核心
-    int32_t order = 0;
-    for (int32_t e=0; e<entropy; e++) order += (Cols[e]>>k&1)<<e;
-    uint32_t match = matchs[order];  // 匹配上的碱基/氨基酸
-    uint32_t carry = *carrys>>k&1;  // 进位
-    uint32_t term0 = row & match;
-    uint32_t term1 = row & (~match);
-    uint32_t carryRow = row+carry;
-    carry = carryRow < row;  // 是否发生进位
-    carryRow += term0;
-    carry |= carryRow < term0;  // 是否发生进位
-    row = carryRow | term1;
-    *carrys &= ~(1<<k); *carrys += carry<<k;  // 写回进位
-  }
-  *line = row;
-}
-// kernel_dynamicGen 动态规划
-template<int32_t entropy>
+__constant__ uint32_t represent[10242];  // 代表序列 常量内存 约40KB
+
+// 不要改内外循环 寄存器使用会变少
+// 不要数据预取 或操作指针 用线程数掩盖延迟
+// kernel_dynamic 动态规划
+template<int32_t entropy, int32_t tabsize>  // 熵 字母表
 __global__ void kernel_dynamic(uint32_t *reads, size_t *offsets,
-uint32_t *remains, int32_t remainCount, uint32_t *cluster, float threshold) {
+uint32_t *remains, const int32_t remainCount, uint32_t *cluster,
+const float threshold) {
   int32_t index = blockDim.x*blockIdx.x+threadIdx.x+1;  // 线程编号
   if (index >= remainCount) return;  // 超出范围
-  // uint32_t *represent = &reads[offsets[remains[0]]];  // 代表序列起始位置
   uint32_t *read = &reads[offsets[remains[index]]];  // 任务序列起始位置
   uint32_t length1 = represent[0];  // 代表序列长度
   uint32_t length2 = read[0];  // 剩余序列长度
   uint32_t netLength1 = represent[1];  // 代表序列净长度
   uint32_t netLength2 = read[1];  // 剩余序列净长度
-
-  uint32_t line[2048];  // 每行结果
-  memset(line, 0xFF, (netLength1+31)/32*sizeof(uint32_t));  // 0:匹配 1:不匹配
+  uint32_t lines[2048];  // 每行结果 别赋初值 开销太大
+  memset(lines, 0xFF, (netLength1+31)/32*sizeof(uint32_t));  // 0:匹配 1:不匹配
   uint32_t Rows[entropy] = {0};  // 从行取的32个碱基/氨基酸
   uint32_t Cols[entropy] = {0};  // 从列取的32个碱基/氨基酸
-  uint32_t RowsPre[entropy] = {0};  // 从行取的32个碱基/氨基酸
-  uint32_t ColsPre[entropy] = {0};  // 从列取的32个碱基/氨基酸
-
-
+  uint32_t matchs[tabsize] = {0};  // 匹配的碱基/氨基酸 寄存器 1匹配 0不匹配
+  int32_t lsft = ceil((float)length2-(float)length2*threshold);  // 左偏移
+  lsft = (lsft+31)/32*32;  // 32对齐
+  int32_t rsft = ceil((float)length1-(float)length2*threshold);  // 右偏移
+  rsft = rsft+33;  // 32补全
   // 计算
-  for (int32_t e=0; e<entropy; e++) ColsPre[e] = read[2+e];
   for (int32_t i=0; i<netLength2; i+=32) {  // 遍历列
     uint32_t carrys = 0;  // 进位
-    for (int32_t e=0; e<entropy; e++) Cols[e] = ColsPre[e];
-    for (int32_t e=0; e<entropy; e++) ColsPre[e] = read[2+(i/32+1)*entropy+e];
-    for (int32_t e=0; e<entropy; e++) RowsPre[e] = represent[2+e];
-    for (int32_t j=0; j<netLength1; j+=32) {  // 遍历行
-      for (int32_t e=0; e<entropy; e++) Rows[e] = RowsPre[e];
-      for (int32_t e=0; e<entropy; e++) RowsPre[e] = represent[2+(j/32+1)*entropy+e];
-      k32<entropy>(Rows, Cols, &carrys, &line[j/32]);
+    for (int32_t e=0; e<entropy; e++) Cols[e] = read[2+i/32*entropy+e];
+    for (int32_t j=max(i-lsft,0); j<min(i+rsft,netLength1); j+=32) {  // 遍历行
+      for (int32_t e=0; e<entropy; e++) Rows[e] = represent[2+j/32*entropy+e];
+      for (int32_t k=0; k<tabsize; k++) {  // 预生成match
+        uint32_t match = 0xFFFFFFFF;
+        for (int32_t e=0; e<entropy; e++) match &= Rows[e]^0xFFFFFFFF+(k>>e&1);
+        matchs[k] = match;
+      }
+      uint32_t row = lines[j/32];  // 上一行结果
+      for (int32_t k=0; k<32; k++) {  // 32*32的核心
+        int32_t order = 0;
+        for (int32_t e=0; e<entropy; e++) order += (Cols[e]>>k&1)<<e;
+        uint32_t match = matchs[order];  // 匹配上的碱基/氨基酸
+        uint32_t carry = carrys&1;  // 进位
+        uint32_t term0 = row & match;
+        uint32_t term1 = row & (~match);
+        uint32_t carryRow = row+carry;
+        carry = carryRow < row;  // 是否发生进位
+        carryRow += term0;
+        carry |= carryRow < term0;  // 是否发生进位
+        row = carryRow | term1;
+        carrys = (carrys>>1)+(carry<<31);  // 写回进位
+      }
+      lines[j/32] = row;
     }
   }
   {  // 统计结果
     int32_t sum = 0;
-    for (int32_t i=0; i<netLength1; i+=32) sum += 32-__popc(line[i/32]);
-    if (netLength1%32!=0 && netLength2%32!=0) {
-      sum -= 32-max(netLength1%32, netLength2%32);
-    }
+    for (int32_t i=0; i<netLength1; i+=32) sum += 32-__popc(lines[i/32]);
+    sum-=min((netLength1+31)/32*32-netLength1,(netLength2+31)/32*32-netLength2);
     int32_t cutoff = ceil((float)length2*threshold);
-    if (sum >= cutoff) {
+    if (sum >= cutoff) {  // 不用优化 没第二个分支 要返回了
       cluster[remains[index]] = remains[0];
       remains[index] = 0xFFFFFFFF;  // 已经聚类了
     }
@@ -153,11 +140,8 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
     for (int32_t i=0; i<readsCount; i++) {  // 字节位置转为uint32_t偏移
       offsets[i] = (offsets[i]-position)/sizeof(uint32_t);
     }
-    if (entropy == 3) {  // 基因
-      std::cout << "data type:\tgene" << "\n";
-    } else {  // 蛋白
-      std::cout << "data type:\tprotein" << "\n";
-    }
+    if (entropy == 3) std::cout << "data type:\tgene" << "\n";  // 基因
+    if (entropy == 5) std::cout << "data type:\tprotein" << "\n";  // 蛋白
     std::cout << "reads count:\t" << readsCount << "\n";  // 序列数
     std::cout << "longest:\t" << reads[0] << "\n";  // 最长
     std::cout << "shortest:\t" << reads[offsets[readsCount-1]] << "\n";  // 最短
@@ -175,18 +159,15 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
     int32_t remainCount = readsCount;  // 剩余序列数
     while (remainCount > 0) {  // 直到剩余序列为0
       // 准备代表序列
-      std::cout << "\r" << remains[0] << "/" << readsCount << std::flush;
-      int32_t repOff = offsets[remains[0]];
-      size_t length = ((reads[repOff]+31)/32*entropy+2)*sizeof(uint32_t);
+      std::cout << "\r" << remains[0]+1 << "/" << readsCount << std::flush;
+      size_t repOff = offsets[remains[0]];
+      size_t length = ((reads[repOff+1]+31)/32*entropy+2)*sizeof(uint32_t);
       cudaMemcpyToSymbol(represent, &reads[repOff], length);
       // 序列比对
-      if (entropy == 3) {  // 基因
-        kernel_dynamic<3><<<(remainCount+255)/256, 256>>>
-          (reads, offsets, remains, remainCount, cluster, threshold);
-      } else {  // 蛋白
-        kernel_dynamic<5><<<(remainCount+255)/256, 256>>>
-          (reads, offsets, remains, remainCount, cluster, threshold);
-      }
+      if (entropy == 3) kernel_dynamic<3, 5><<<(remainCount+63)/64, 64>>>
+        (reads, offsets, remains, remainCount, cluster, threshold);  // 基因
+      if (entropy == 5) kernel_dynamic<5, 23><<<(remainCount+63)/64, 64>>>
+        (reads, offsets, remains, remainCount, cluster, threshold);  // 蛋白
       // 计算剩余任务
       cudaMemPrefetchAsync(remains, sizeof(uint32_t)*remainCount,
         cudaCpuDeviceId, 0);  // toHost
@@ -199,7 +180,7 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
         }
       }
       remainCount = count;  // 剩余序列数就是任务数
-      cudaMemPrefetchAsync(remains, sizeof(uint32_t)*remainCount, 0);
+      cudaMemPrefetchAsync(remains, sizeof(uint32_t)*remainCount, 0);  // toGPU
     }
     cudaDeviceSynchronize();  // 整体退出
     std::cout << "\r" << readsCount << "/" << readsCount << "\n";
@@ -226,10 +207,18 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
 // -maxrregcount 56 --resource-usage
 // cudaMemPrefetchAsync(remains, sizeof(uint32_t)*remainCount, cudaCpuDeviceId, 0);
 // cudaMemPrefetchAsync(remains, sizeof(uint32_t)*remainCount, 0);
+// cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);  // 共享内存变缓存
 // __restrict__
 // 常量内存
 // 显存内计算remains
 // 少量序列用batch
 
-// gene   : 90 9392 22.8242s
-// protein: 80 5399 11.8318s
+// gene   : 90 9392 6.43686s
+// protein: 80 5399 5.07424s
+
+// 4090的SM参数:
+// 1536个线程
+// 48个warp
+// 24个block
+// 64K个寄存器
+// 八个warp就能隐藏延迟了，四发射，64线程足够
