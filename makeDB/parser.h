@@ -53,13 +53,17 @@ private:
   }
 
 public:
-  Parser() {}  // 构建
-  ~Parser() {}  // 析构
+  Parser() {
+    records.clear();
+  }  // 构建
+  ~Parser() {
+    records.clear();
+  }  // 析构
 
   void add(const std::string name, const std::string shortName,
   const std::string describe, const std::string dataType,
   const std::string defaultValue, const bool isNecessary) {  // 注册参数
-    Record record;
+    Record record = {"", "", "", "", false, false};
     record.shortName = shortName;
     record.describe = describe;
     record.dataType = dataType;
@@ -121,3 +125,4 @@ public:
 };
 }
 #endif  // __PARSERH__
+
