@@ -118,15 +118,17 @@ const float threshold) {
 
 // clustering 聚类
 void clustering(const Option &option, std::vector<int32_t> &result) {
-  int32_t entropy = 0;  // 数据的熵
-  int32_t readsCount = 0;  // 序列数
+  uint32_t entropy = 0;  // 数据的熵
+  uint32_t readsCount = 0;  // 序列数
+  size_t hashOffset = 0;  // hash偏移
   size_t *offsets = NULL;  // 序列偏移
   uint32_t *reads = NULL;  // 序列数据
   {  // 读数据
     std::ifstream packedFile(option.packedFile);  // packed文件
-    packedFile.read((char*)&entropy, sizeof(int32_t));  // 读序列类型
-    packedFile.read((char*)&readsCount, sizeof(int32_t));  // 读序列数
-    cudaMallocManaged(&offsets, sizeof(size_t)*(readsCount+1));  // 序列偏移
+    packedFile.read((char*)&entropy, sizeof(uint32_t));  // 读序列类型
+    packedFile.read((char*)&readsCount, sizeof(uint32_t));  // 读序列数
+    packedFile.read((char*)&hashOffset, sizeof(size_t));  // hash偏移
+    cudaMallocManaged(&offsets, sizeof(size_t)*(readsCount+1));  // packed偏移
     cudaMemAdvise(offsets, sizeof(size_t)*(readsCount+1),
       cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
     packedFile.read((char*)offsets, sizeof(size_t)*(readsCount+1));  // 序列偏移
@@ -136,7 +138,7 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
     packedFile.seekg(offsets[0], std::ios::beg);  // 移位
     packedFile.read((char*)reads, offsets[readsCount]-offsets[0]);  // 打包数据
     packedFile.close();  // 读文件完成
-    size_t position = sizeof(int32_t)*2+sizeof(size_t)*readsCount*2;
+    size_t position = offsets[0];  // 偏移的起始位置
     for (int32_t i=0; i<readsCount; i++) {  // 字节位置转为uint32_t偏移
       offsets[i] = (offsets[i]-position)/sizeof(uint32_t);
     }
@@ -222,3 +224,55 @@ void clustering(const Option &option, std::vector<int32_t> &result) {
 // 24个block
 // 64K个寄存器
 // 八个warp就能隐藏延迟了，四发射，64线程足够
+
+
+
+
+// {  // 预聚类
+//   std::vector<std::vector<uint32_t>> pairs(5, std::vector<uint32_t>());
+//   std::unordered_map<std::string, uint32_t> represents;  // 代表序列
+//   for (uint32_t i=0; i<5; i++) {  // 遍历r
+//     uint32_t r = pow(2, i);
+//     uint32_t b = 64/r;
+//     represents.clear();  // 清空代表序列
+//     for (uint32_t j=0; j<b; j++) {  // 遍历b
+//       for (uint32_t k=0; k<readsCount; k++) {  // 遍历签名矩阵
+//         std::string signedName = "";
+//         for (int32_t l=r*j; l<r*j+r; l++) {
+//           signedName += std::to_string(signedMatrix[k][l])+" ";
+//         }
+//         auto iterator = represents.find(signedName);
+//         if (iterator == represents.end()) {  // 没找到代表序列
+//           represents[signedName] = k;
+//         } else {  // 找到了代表序列
+//           pairs[i].push_back(iterator->second);
+//           pairs[i].push_back(k);
+//         }
+//       }
+//     }
+//   }
+//   // 写入结果
+//   std::ofstream clusterFile(option.packedFile, std::ios::in);  // preCluster
+//   clusterFile.seekp(offset, std::ios::beg);  // 移到preCluster开始
+//   size_t length = 0;  // 数据长度
+//   for (uint32_t i=0; i<5; i++) {  // 写预聚类数据
+//     length = pairs[i].size();
+//     clusterFile.write((char*)&length, sizeof(size_t));
+//     clusterFile.write((char*)pairs[i].data(), sizeof(uint32_t)*length);
+//   }
+//   length = sizeof(uint32_t)*2+sizeof(size_t)*readsCount*2;
+//   clusterFile.seekp(length, std::ios::beg);  // 移到preCluster开始
+//   for (int32_t i=0; i<5; i++) {  // 写偏移
+//     clusterFile.write((char*)&offset, sizeof(size_t));
+//     offset += sizeof(size_t)+sizeof(uint32_t)*pairs[0].size();
+//   }
+//   clusterFile.close();
+// }
+
+
+//  r  b   s  value
+// 01 64 0.05 0.9624758607888840
+// 02 32 0.30 0.9510982327503508
+// 04 16 0.65 0.9569802167317568
+// 08 08 0.87 0.9585180051096697
+// 16 04 0.97 0.9778584874251552
