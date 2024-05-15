@@ -13,7 +13,7 @@
   函数接口没有错误处理，一定不能瞎用！
   函数接口没有错误处理，一定不能瞎用！
   函数接口没有错误处理，一定不能瞎用！
-  2024/03/17 by 鞠震
+  2024/05/15 by 鞠震
 */
 
 #include <iostream>  // cout
@@ -35,18 +35,24 @@ private:
   std::map<std::string, Record> records;  // 记录们
   void help(const std::string command) {  // 打印帮助
     std::cout << "usage: " << command << " ";
-    for (auto it = records.begin(); it != records.end(); it++) {
-      if (it->second.isNecessary) {
-        std::cout << "-" << it->second.shortName << " <";
-        std::cout << it->first << "> ";
+    for (const auto &record:records) {  // 遍历记录
+      if (record.second.isNecessary) {  // 只打印必须参数
+        std::cout << record.second.shortName << " <" << record.first << "> ";
       }
     }
     std::cout << " ...\noption:\n";
-    for (auto it = records.begin(); it != records.end(); it++) {
-      std::cout << "  " << it->second.shortName;
-      std::cout << "\t" << it->second.describe;
-      std::cout << " (" << it->second.dataType << ")";
-      if (it->second.isNecessary) std::cout << " *";
+    for (const auto &record:records) {  // 必要选项的详细信息
+      if (!record.second.isNecessary) continue;
+      std::cout << "  " << record.second.shortName;
+      std::cout << "\t" << record.second.describe;
+      std::cout << " (" << record.second.dataType << ")";
+      std::cout << " *\n";
+    }
+    for (const auto &record:records) {  // 非必要选项的详细信息
+      if (record.second.isNecessary) continue;
+      std::cout << "  " << record.second.shortName;
+      std::cout << "\t" << record.second.describe;
+      std::cout << " (" << record.second.dataType << ")";
       std::cout << "\n";
     }
     std::cout << "  * is necessary.\n";
@@ -79,41 +85,32 @@ public:
   float getFloat(const std::string name) {  // 读取float参数
     return std::stof(records[name].defaultValue);
   }
-  double getDouble(const std::string name) {  // 读取double参数
-    return std::stod(records[name].defaultValue);
-  }
   std::string getString(const std::string name) {  // 读取string参数
     return records[name].defaultValue;
   }
 
   bool parse(int argc, char **argv) {  // 解析函数
-    for (auto i=1; i<argc; i++) {  // 读参数
-      for (auto it = records.begin(); it != records.end(); it++) {
-        if (it->second.shortName == argv[i] && i+1<argc) {
-          it->second.defaultValue = argv[i+1];
-          it->second.isAssignment = true;
+    for (int32_t i=1; i<argc; i++) {  // 读参数
+      for (auto &record:records) {
+        if (record.second.shortName==argv[i] && i+1<argc) {
+          record.second.defaultValue = argv[i+1];
+          record.second.isAssignment = true;
           i += 1;
         }
       }
     }
     bool checkSuccess = true;  // 校验是否成功
-    for (auto it = records.begin(); it != records.end(); it++) {  // 校验参数
-      checkSuccess &= it->second.isNecessary?it->second.isAssignment:true;
-      if (it->second.dataType == "int32_t") {  // int类型
+    for (const auto &record:records) {  // 校验参数
+      checkSuccess &= record.second.isNecessary?record.second.isAssignment:true;
+      if (record.second.dataType == "int32_t") {  // int类型
         try {
-          auto a = std::stoi(it->second.defaultValue);
+          auto a = std::stoi(record.second.defaultValue);
         } catch (...) {
           checkSuccess = false;
         }
-      } else if (it->second.dataType == "float") {  // float类型
+      } else if (record.second.dataType == "float") {  // float类型
         try {
-          auto a = std::stof(it->second.defaultValue);
-        } catch (...) {
-          checkSuccess = false;
-        }
-      } else if (it->second.dataType == "double") {  // double类型
-        try {
-          std::stod(it->second.defaultValue);
+          auto a = std::stof(record.second.defaultValue);
         } catch (...) {
           checkSuccess = false;
         }
