@@ -27,6 +27,7 @@ makeDB -f fasta文件 -p packed文件
 #include <iostream>  // cout
 #include <fstream>  // fstream
 #include <vector>  // vector
+#include <unordered_map>  // unordered_map
 #include <algorithm>  // stable_sort
 #include <cmath>  // pow
 #include <omp.h>  // openmp
