@@ -138,7 +138,8 @@ void clusteringPrecise(const Option &option, std::vector<uint32_t> &results) {
     std::ifstream packedFile(option.packedFile);  // packed文件
     packedFile.read((char*)&entropy, sizeof(uint32_t));  // 读序列类型
     packedFile.read((char*)&readsCount, sizeof(uint32_t));  // 读序列数
-    packedFile.seekg(sizeof(size_t), std::ios::cur);  // 跳过hashTable
+    size_t distance = sizeof(uint32_t)*readsCount*2;
+    packedFile.seekg(distance, std::ios::cur);  // 跳过序列长度数据
     cudaMallocManaged(&offsets, sizeof(size_t)*(readsCount+1));  // packed偏移
     cudaMemAdvise(offsets, sizeof(size_t)*(readsCount+1),
       cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
@@ -280,22 +281,24 @@ const uint32_t jobCount, uint32_t *cluster, const float threshold) {
 void clusteringFast(const Option &option, std::vector<uint32_t> &results) {
   uint32_t entropy = 0;  // 数据的熵
   uint32_t readsCount = 0;  // 序列数
-  std::vector<uint16_t> hashTable(0);  // hashTable
+  std::vector<uint32_t> hashTable(0);  // hashTable
   size_t *offsets = NULL;  // 序列偏移
   uint32_t *reads = NULL;  // 序列数据
   {  // 读数据start
     std::ifstream packedFile(option.packedFile);  // packed文件
     packedFile.read((char*)&entropy, sizeof(uint32_t));  // 读序列类型
     packedFile.read((char*)&readsCount, sizeof(uint32_t));  // 读序列数
-    size_t hashOffset = 0;  // hastTable偏移
-    packedFile.read((char*)&hashOffset, sizeof(size_t));  // hashTable偏移
+    size_t distance = sizeof(uint32_t)*readsCount*2;
+    packedFile.seekg(distance, std::ios::cur);  // 跳过序列长度数据
     cudaMallocManaged(&offsets, sizeof(size_t)*(readsCount+1));  // packed偏移
     cudaMemAdvise(offsets, sizeof(size_t)*(readsCount+1),
       cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
     packedFile.read((char*)offsets, sizeof(size_t)*(readsCount+1));  // 序列偏移
     hashTable.assign(readsCount*64, 0);  // hashTable
+    size_t hashOffset = sizeof(uint32_t)*(2+readsCount*2);  // hashTable偏移
+    hashOffset += sizeof(size_t)*readsCount*2;
     packedFile.seekg(hashOffset, std::ios::beg);  // 移到hashTable处
-    packedFile.read((char*)hashTable.data(), sizeof(uint16_t)*readsCount*64);
+    packedFile.read((char*)hashTable.data(), sizeof(uint32_t)*readsCount*64);
     cudaMallocManaged(&reads, offsets[readsCount]-offsets[0]);  // 打包数据
     cudaMemAdvise(reads, offsets[readsCount]-offsets[0],
       cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
@@ -399,8 +402,8 @@ void conutResult(const Option &option, const std::vector<uint32_t> &results) {
     std::ifstream fastaFile(option.packedFile);  // 输入
     std::ofstream resultFile(option.resultFile);  // 输出
     std::vector<size_t> offsets(readsCount, 0);  // 序列偏移
-    fastaFile.seekg(sizeof(uint32_t)*2+sizeof(size_t)*(1+readsCount),
-      std::ios::beg);  // 跳到序列偏移开始位置
+    fastaFile.seekg(sizeof(uint32_t)*(2+readsCount*2)+
+      sizeof(size_t)*(readsCount), std::ios::beg);  // 跳到序列偏移开始位置
     fastaFile.read((char*)offsets.data(), sizeof(size_t)*readsCount);  // 读偏移
     std::string name="", read="";  // 序列名 序列数据
     uint32_t count = 0;  // 代表序列的数量

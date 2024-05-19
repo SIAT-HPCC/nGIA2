@@ -3,13 +3,14 @@ makeDB.cpp
 输出文件数据内容:
   uint32_t 序列的熵 * 1
   uint32_t 序列数 * 1
-  size_t hashTable偏移 *1
+  vector<uint32_t> 序列名长度 * readsCount
+  vector<uint32_t> 序列数据长度 * readsCount
   vector<size_t> packed数据偏移 * readsCount
   vector<size_t> fasta数据偏移 * readsCount
   hashTable数据
-    uint_t hash签名 * readsCount*64
+    uint32_t hash签名 * readsCount*64
   packed数据
-    uint32_t 长度 * 1
+    uint32_t 数据长度 * 1
     uint32_t 净长度 * 1
     uint32_t 压缩数据 * n
   fasta数据
@@ -29,7 +30,6 @@ makeDB -f fasta文件 -p packed文件
 #include <vector>  // vector
 #include <unordered_map>  // unordered_map
 #include <algorithm>  // stable_sort
-#include <cmath>  // pow
 #include <omp.h>  // openmp
 #include "parser.h"  // parser
 #include "timer.h"  // timer
@@ -52,15 +52,15 @@ struct Read {  // 记录一条序列的位置 为了排序
 void init(int argc, char **argv, Option &option) {
   {  // 解析命令行
     Parser::Parser parser;  // 解析器
-    parser.add("fasta", "-f", "fasta file", "string", "", true);
-    parser.add("packed", "-p", "packed file", "string", "", true);
+    parser.add("fasta", "-f", "fasta file", "string", "", true);  // fasta
+    parser.add("packed", "-p", "packed file", "string", "", true);  // packed
     if (!parser.parse(argc, argv)) exit(0);  // 解析
     option.fastaFile = parser.getString("fasta");  // fasta文件
     option.packedFile = parser.getString("packed");  // packed文件
     std::cout << "fasta:\t" << option.fastaFile << "\n";
     std::cout << "packed:\t" << option.packedFile << "\n";
   }
-  {  // 校验参数 判断gene/protein
+  {  // 校验参数
     std::ifstream fastaFile(option.fastaFile);  // fasta文件
     if (!fastaFile.is_open()) {  // 判断文件存在
       std::cout << option.fastaFile << " not exists\n";
@@ -79,7 +79,7 @@ void init(int argc, char **argv, Option &option) {
     fastaFile.close();
     if (option.entropy == 3) std::cout << "type:\tgene\n";  // 基因
     if (option.entropy == 5) std::cout << "type:\tprotein\n";  // 蛋白
-  }  // 用单独的if判断gene/protein 后面改熵不容易出错
+  }  // 用单独的if分别判断 gene/protein 后面改熵不容易出错
 }
 
 // makeIndex 文件索引
@@ -101,11 +101,11 @@ void makeIndex(const Option &option, std::vector<Read> &reads) {
         read.readLength += line.size();
       }
       if (read.readLength <= 65536) reads.push_back(read);  // 不超65536 入队
-      if (reads.size()%(1<<20) == 0) std::cout << "." << std::flush;
+      if ((reads.size()&1024*1024-1) == 0) std::cout << "." << std::flush;
     }
     fastaFile.close();
-    reads.shrink_to_fit();  // 省点内存
     std::cout << " finish\n";
+    reads.shrink_to_fit();  // 省点内存
   }
   std::stable_sort(reads.begin(), reads.end(), [](const Read &a, const Read &b)
     {return a.readLength > b.readLength;});  // 排序
@@ -131,7 +131,7 @@ std::unordered_map<char, uint32_t> transTablePro = {  // 蛋白转码表
 // makeData 生成数据 acgt -> 1010 1100
 template <uint32_t entropy>
 inline void packData(const std::string &read, std::vector<uint32_t> &packed) {
-  packed.assign(2+(read.size()+31)/32*entropy, 0);  // 初始化
+  packed.assign(2+(read.size()+31>>5)*entropy, 0);  // 初始化
   uint32_t packs[entropy] = {0};  // 打包后数据 编译会展开成寄存器
   uint32_t netLength = 0;  // 净长度
   std::unordered_map<char, uint32_t> *transTable;
@@ -145,15 +145,15 @@ inline void packData(const std::string &read, std::vector<uint32_t> &packed) {
       packs[e] = ((pack>>e&1)<<31)+(packs[e]>>1);
     }
     netLength += 1;
-    if (netLength%32 == 0) {  // 每32个氨基酸存储一次
+    if ((netLength&31) == 0) {  // 每32个氨基酸存储一次
       for (uint32_t e=0; e<entropy; e++) {
-        packed[2+(netLength/32-1)*entropy+e] = packs[e];
+        packed[2+((netLength>>5)-1)*entropy+e] = packs[e];
       }
     }
   }
-  if (netLength%32 > 0) {  // 补齐
+  if ((netLength&31) > 0) {  // 补齐
     for (uint32_t e=0; e<entropy; e++) {
-      packed[2+netLength/32*entropy+e] = packs[e]>>32-netLength%32;
+      packed[2+(netLength>>5)*entropy+e] = packs[e]>>32-(netLength&31);
     }
   }
   packed[0] = read.size();  // 长度
@@ -177,7 +177,7 @@ std::unordered_map<char, uint32_t> kmerTablePro = {  // 蛋白转码表
 // hashData 生成hash签名 基因4**8 蛋白16**4 = 65536
 template <uint32_t entropy>
 inline void hashData(const std::string &read, std::vector<uint32_t> &kmers,
-std::vector<uint16_t> &hashLine) {
+std::vector<uint32_t> &hashLine) {
   {  // 生成k-mer
     kmers.assign(2048, 0);  // k-mer初始化
     hashLine.assign(64, 0);  // hash签名初始化
@@ -189,15 +189,15 @@ std::vector<uint16_t> &hashLine) {
       auto iterator = (*kmerTable).find(base);  // 查找结果
       if (iterator == (*kmerTable).end()) continue;  // 未知碱基/氨基酸
       kmer = ((kmer<<entropy)+iterator->second)&0xFFFF;  // 生成K-mer
-      kmers[kmer/32] = (kmers[kmer/32]&~(1<<kmer%32))+(1<<kmer%32);  // 记录
+      kmers[kmer/32] = (kmers[kmer>>5]&~(1<<(kmer&31)))+(1<<(kmer&31));  // 记录
     }
   }
   {  // 生成签名 index = (ax+a）%65536 a与65536互质 a=1,3,5,7,9...
     for (uint32_t i=0; i<64; i++) {  // 随机排列64次
       uint32_t a = i*2+1;  // 随机系数
       for (uint32_t j=0; j<65536; j++) {  // 遍历kmer记录
-        uint32_t index = (a*j+a)%65536;  // 生成的随机数
-        if ((kmers[index/32]&(1<<index%32)) > 0) {  // 找到第一个kmer
+        uint32_t index = (a*j+a)&65535;  // 生成的随机数
+        if ((kmers[index>>5]&(1<<(index&31))) > 0) {  // 找到第一个kmer
           hashLine[i] = index;
           break;
         }
@@ -210,25 +210,31 @@ std::vector<uint16_t> &hashLine) {
 void makeDB(const Option &option, std::vector<Read> &reads) {
   uint32_t entropy = option.entropy;  // 熵
   uint32_t readsCount = reads.size();  // 序列数
-  size_t hashOffset = 0;  // 哈希签名偏移
   std::vector<size_t> inputOffsets(readsCount, 0);  // 输入文件偏移
   std::vector<size_t> packedOffsets(readsCount, 0);  // packed偏移
   std::vector<size_t> fastaOffsets(readsCount, 0);  // fasta偏移
   {  // 计算偏移 写入 熵 hashTable偏移 packed偏移 fasta偏移
+    std::vector<uint32_t> nameLengths(readsCount, 0);  // 序列名长度
+    std::vector<uint32_t> readLengths(readsCount, 0);  // 序列数据长度
+    for (uint32_t i=0; i<readsCount; i++) {
+      inputOffsets[i] = reads[i].offset;  // 输入文件的偏移
+      nameLengths[i] = reads[i].nameLength;  // 序列名长度
+      readLengths[i] = reads[i].readLength;  // 序列数据长度
+    }
     std::ofstream packedFile(option.packedFile);  // 输出文件
     packedFile.write((char*)&entropy, sizeof(uint32_t));  // 序列的熵
     packedFile.write((char*)&readsCount, sizeof(uint32_t));  // 序列数
-    hashOffset = sizeof(uint32_t)*2+sizeof(size_t)*(1+readsCount*2);
-    packedFile.write((char*)&hashOffset, sizeof(size_t));  // hashTable偏移
-    for (uint32_t i=0; i<readsCount; i++) inputOffsets[i] = reads[i].offset;
-    size_t offset = hashOffset+sizeof(uint16_t)*readsCount*64;
+    packedFile.write((char*)nameLengths.data(), sizeof(uint32_t)*readsCount);
+    packedFile.write((char*)readLengths.data(), sizeof(uint32_t)*readsCount);
+    size_t offset = sizeof(uint32_t)*(2+readsCount*2);  // 当前指针
+    offset += sizeof(size_t)*readsCount*2+sizeof(uint32_t)*64*readsCount;
     for (uint32_t i=0; i<readsCount; i++) {  // packed偏移
       packedOffsets[i] = offset;
-      offset += sizeof(uint32_t)*(2+(reads[i].readLength+31)/32*option.entropy);
+      offset += sizeof(uint32_t)*(2+(readLengths[i]+31>>5)*option.entropy);
     }
     for (uint32_t i=0; i<readsCount; i++) {  // fasta偏移
       fastaOffsets[i] = offset;
-      offset += reads[i].nameLength+reads[i].readLength+2;  // 包括换行
+      offset += nameLengths[i]+readLengths[i]+2;  // 包括换行
     }
     packedFile.write((char*)packedOffsets.data(), sizeof(size_t)*readsCount);
     packedFile.write((char*)fastaOffsets.data(), sizeof(size_t)*readsCount);
@@ -244,7 +250,7 @@ void makeDB(const Option &option, std::vector<Read> &reads) {
     std::string line="", name="", read="";  // 读入一行 序列名 序列数据
     std::vector<uint32_t> packed(0);  // 压缩数据
     std::vector<uint32_t> kmers(2048, 0);  // k-mer统计结果
-    std::vector<uint16_t> hashLine(64, 0);  // 一行哈希签名
+    std::vector<uint32_t> hashLine(64, 0);  // 一行哈希签名
     #pragma omp master
     {std::cout << "pack:\t." << std::flush;}  // 打印进度
     #pragma omp for schedule (dynamic)  // 并行任务 写packed数据 生成签名
@@ -260,14 +266,16 @@ void makeDB(const Option &option, std::vector<Read> &reads) {
       if (option.entropy == 5) packData<5>(read, packed);  // 打包protein
       if (option.entropy == 3) hashData<2>(read, kmers, hashLine);  // gene
       if (option.entropy == 5) hashData<4>(read, kmers, hashLine);  // protein
-      hashFile.seekp(hashOffset+sizeof(uint16_t)*i*64, std::ios::beg);  // hash
-      hashFile.write((char*)hashLine.data(),sizeof(uint16_t)*hashLine.size());
+      size_t hashOffset = sizeof(uint32_t)*(2+readsCount*2);  // hashTable偏移
+      hashOffset += sizeof(size_t)*readsCount*2+sizeof(uint32_t)*64*i;
+      hashFile.seekp(hashOffset, std::ios::beg);
+      hashFile.write((char*)hashLine.data(),sizeof(uint32_t)*hashLine.size());
       packedFile.seekp(packedOffsets[i], std::ios::beg);  // 移到packed文件起始
       packedFile.write((char*)packed.data(), sizeof(uint32_t)*packed.size());
       line = name+"\n"+read+"\n";
       fastaFile.seekp(fastaOffsets[i], std::ios::beg);  // 移到fasta文件起始
       fastaFile.write((char*)line.c_str(), line.size());  // 写序列
-      if (i%(1<<20) == 0) std::cout << "." << std::flush;  // 打印进度
+      if ((i+1&1024*1024-1) == 0) std::cout << "." << std::flush;  // 打印进度
     }
     #pragma omp master
     {std::cout << " finish\n";}
