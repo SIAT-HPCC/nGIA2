@@ -7,6 +7,7 @@
 #include <vector>  // vector
 #include <unordered_map>  // unordered_map
 #include <algorithm>  // stable_sort
+#include <omp.h>  // openmp
 #include "parser.h"  // 解析器
 #include "timer.h"  // timer
 #include "func.h"  // 数据结构与函数
@@ -138,7 +139,7 @@ void clusteringPrecise(const Option &option, std::vector<uint32_t> &results) {
     std::ifstream packedFile(option.packedFile);  // packed文件
     packedFile.read((char*)&entropy, sizeof(uint32_t));  // 读序列类型
     packedFile.read((char*)&readsCount, sizeof(uint32_t));  // 读序列数
-    size_t distance = sizeof(uint32_t)*readsCount*2;
+    size_t distance = sizeof(uint32_t)*(1+readsCount*2);
     packedFile.seekg(distance, std::ios::cur);  // 跳过序列长度数据
     cudaMallocManaged(&offsets, sizeof(size_t)*(readsCount+1));  // packed偏移
     cudaMemAdvise(offsets, sizeof(size_t)*(readsCount+1),
@@ -281,6 +282,7 @@ const uint32_t jobCount, uint32_t *cluster, const float threshold) {
 void clusteringFast(const Option &option, std::vector<uint32_t> &results) {
   uint32_t entropy = 0;  // 数据的熵
   uint32_t readsCount = 0;  // 序列数
+  uint32_t signedSize = 0;  // hash签名大小
   std::vector<uint32_t> hashTable(0);  // hashTable
   size_t *offsets = NULL;  // 序列偏移
   uint32_t *reads = NULL;  // 序列数据
@@ -288,17 +290,18 @@ void clusteringFast(const Option &option, std::vector<uint32_t> &results) {
     std::ifstream packedFile(option.packedFile);  // packed文件
     packedFile.read((char*)&entropy, sizeof(uint32_t));  // 读序列类型
     packedFile.read((char*)&readsCount, sizeof(uint32_t));  // 读序列数
+    packedFile.read((char*)&signedSize, sizeof(uint32_t));  // hash签名大小
     size_t distance = sizeof(uint32_t)*readsCount*2;
     packedFile.seekg(distance, std::ios::cur);  // 跳过序列长度数据
     cudaMallocManaged(&offsets, sizeof(size_t)*(readsCount+1));  // packed偏移
     cudaMemAdvise(offsets, sizeof(size_t)*(readsCount+1),
       cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
     packedFile.read((char*)offsets, sizeof(size_t)*(readsCount+1));  // 序列偏移
-    hashTable.assign(readsCount*64, 0);  // hashTable
-    size_t hashOffset = sizeof(uint32_t)*(2+readsCount*2);  // hashTable偏移
+    hashTable.assign(readsCount*signedSize, 0);  // hashTable
+    size_t hashOffset = sizeof(uint32_t)*(3+readsCount*2);  // hashTable偏移
     hashOffset += sizeof(size_t)*readsCount*2;
     packedFile.seekg(hashOffset, std::ios::beg);  // 移到hashTable处
-    packedFile.read((char*)hashTable.data(), sizeof(uint32_t)*readsCount*64);
+    packedFile.read((char*)hashTable.data(), sizeof(uint32_t)*hashTable.size());
     cudaMallocManaged(&reads, offsets[readsCount]-offsets[0]);  // 打包数据
     cudaMemAdvise(reads, offsets[readsCount]-offsets[0],
       cudaMemAdviseSetReadMostly, 0);  // 告诉编译器 只读不写
@@ -324,7 +327,14 @@ void clusteringFast(const Option &option, std::vector<uint32_t> &results) {
     if (0.30f<=threshold && threshold<0.65f) {row= 2; block=32;}  // 30-65
     if (0.65f<=threshold && threshold<0.87f) {row= 4; block=16;}  // 65-87
     if (0.87f<=threshold && threshold<0.97f) {row= 8; block= 8;}  // 87-97
-    if (0.97f<=threshold && threshold<0.99f) {row=16; block= 4;}  // 97-99
+    if (0.97f<=threshold && threshold<1.00f) {row=16; block= 4;}  // 97-99
+    // for (uint32_t i=1; i<=signedSize; i++) {
+    //   row = i;
+    //   block = signedSize/row;
+    //   if (1.0f-pow(1.0f-pow(threshold, row), block) < 0.95f) break;
+    // }
+    // row -= 1;
+    // block = signedSize/row;
     std::cout << "hash row:\t" << row << "\n";
     std::cout << "hash blk:\t" << block << "\n";
     cudaMallocManaged(&cluster, sizeof(uint32_t)*readsCount);  // 聚类结果
@@ -388,8 +398,9 @@ void clusteringFast(const Option &option, std::vector<uint32_t> &results) {
 
 // countResult 统计结果
 void conutResult(const Option &option, const std::vector<uint32_t> &results) {
+  Timer::Timer timerWhol;
   uint32_t readsCount = results.size();  // 序列数
-  std::vector<uint64_t> orders(readsCount, 0);  // 前32bit代表 后32bit任务
+  std::vector<uint64_t> orders(readsCount, 0);  // 前32bit代表序列 后32bit任务序列
   {  // 计算结果文件的写入顺序
     for (uint32_t i=0; i<readsCount; i++) {  // 遍历结果
       uint32_t rep = results[i];  // 记录了代表序列
@@ -398,35 +409,63 @@ void conutResult(const Option &option, const std::vector<uint32_t> &results) {
     }
     std::stable_sort(orders.begin(), orders.end());  // 排序
   }
+  std::vector<size_t> fastaOffsets(readsCount, 0);  // 输入文件的偏移
+  std::vector<size_t> resultOffsets(readsCount, 0);  // 结果文件的偏移
+  {  // 计算结果文件的偏移
+    std::vector<uint32_t> nameLengths(readsCount, 0);  // 序列名长度
+    std::vector<uint32_t> readLengths(readsCount, 0);  // 序列长度
+    std::ifstream fastaFile(option.packedFile);  // 输入文件
+    fastaFile.seekg(sizeof(uint32_t)*3, std::ios::beg);  // 跳到长度位置
+    fastaFile.read((char*)nameLengths.data(), sizeof(uint32_t)*readsCount);
+    fastaFile.read((char*)readLengths.data(), sizeof(uint32_t)*readsCount);
+    fastaFile.seekg(sizeof(size_t)*readsCount, std::ios::cur);  // 跳到偏移位置
+    fastaFile.read((char*)fastaOffsets.data(), sizeof(size_t)*readsCount);
+    size_t offset = 0;
+    uint32_t count = 0;  // 代表序列的数量
+    for (uint32_t i=0; i<readsCount; i++) {
+      uint32_t rep = (orders[i]>>32)&0xFFFFFFFF;  // 代表序列
+      uint32_t job = orders[i]&0xFFFFFFFF;  // 任务序列
+      resultOffsets[job] = offset;
+      if (job == rep) {  // 代表序列 顶格
+        offset += nameLengths[job]+readLengths[job]+2;
+        count += 1;
+      } else {  // 非代表序列 前方加两个空格
+        offset += nameLengths[job]+3;
+      }
+    }
+    fastaFile.close();
+    std::cout << "cluster:\t" << count << "\n";
+  }
+  #pragma omp parallel num_threads(6)  // 固态硬盘 线程刚好足够
   {  // 写入结果文件
     std::ifstream fastaFile(option.packedFile);  // 输入
-    std::ofstream resultFile(option.resultFile);  // 输出
-    std::vector<size_t> offsets(readsCount, 0);  // 序列偏移
-    fastaFile.seekg(sizeof(uint32_t)*(2+readsCount*2)+
-      sizeof(size_t)*(readsCount), std::ios::beg);  // 跳到序列偏移开始位置
-    fastaFile.read((char*)offsets.data(), sizeof(size_t)*readsCount);  // 读偏移
+    std::ofstream resultFile(option.resultFile, std::ios::in);  // 输出
     std::string name="", read="";  // 序列名 序列数据
-    uint32_t count = 0;  // 代表序列的数量
-    std::cout << "write results:\n";
+    #pragma omp master
+    {std::cout << "save:\t." << std::flush;}  // 打印进度
+    #pragma omp for
     for (uint32_t i=0; i<readsCount; i++) {  // 写入结果
       uint32_t rep = (orders[i]>>32)&0xFFFFFFFF;  // 代表序列
       uint32_t job = orders[i]&0xFFFFFFFF;  // 任务序列
-      fastaFile.seekg(offsets[job], std::ios::beg);  // 跳到序列开始
+      fastaFile.seekg(fastaOffsets[job], std::ios::beg);  // 跳到输入开始
       getline(fastaFile, name); name += "\n";  // 读序列名
       getline(fastaFile, read); read += "\n";  // 读序列数据
+      resultFile.seekp(resultOffsets[job], std::ios::beg);  // 跳到输出开始
       if (rep == job) {  // 代表序列
         resultFile.write((char*)name.data(), name.size());
         resultFile.write((char*)read.data(), read.size());
-        count += 1;
       } else {  // 任务序列
-        name = "\t"+name;
+        name = "  "+name;
         resultFile.write((char*)name.data(), name.size());
       }
-      if (i%1024 == 0) std::cout<<"\r"<<i+1<<"/"<<readsCount<< std::flush;
+      if ((i+1)%(1024*1024) == 0) std::cout << "." << std::flush;  // 打印进度
     }
-    std::cout << "\r" << readsCount << "/" << readsCount << "\n";
-    std::cout << "cluster:\t" << count << "\n";
+    #pragma omp master
+    {std::cout << " finish\n";}
+    fastaFile.close();
+    resultFile.close();
   }
+  std::cout << "总体耗时:\t"; timerWhol.getDuration();
 }
 
 // 优化
@@ -451,51 +490,6 @@ void conutResult(const Option &option, const std::vector<uint32_t> &results) {
 // 24个block
 // 64K个寄存器
 // 八个warp就能隐藏延迟了，四发射，64线程足够
-
-
-
-
-// {  // 预聚类
-//   std::vector<std::vector<uint32_t>> pairs(5, std::vector<uint32_t>());
-//   std::unordered_map<std::string, uint32_t> represents;  // 代表序列
-//   for (uint32_t i=0; i<5; i++) {  // 遍历r
-//     uint32_t r = pow(2, i);
-//     uint32_t b = 64/r;
-//     represents.clear();  // 清空代表序列
-//     for (uint32_t j=0; j<b; j++) {  // 遍历b
-//       for (uint32_t k=0; k<readsCount; k++) {  // 遍历签名矩阵
-//         std::string signedName = "";
-//         for (int32_t l=r*j; l<r*j+r; l++) {
-//           signedName += std::to_string(signedMatrix[k][l])+" ";
-//         }
-//         auto iterator = represents.find(signedName);
-//         if (iterator == represents.end()) {  // 没找到代表序列
-//           represents[signedName] = k;
-//         } else {  // 找到了代表序列
-//           pairs[i].push_back(iterator->second);
-//           pairs[i].push_back(k);
-//         }
-//       }
-//     }
-//   }
-//   // 写入结果
-//   std::ofstream clusterFile(option.packedFile, std::ios::in);  // preCluster
-//   clusterFile.seekp(offset, std::ios::beg);  // 移到preCluster开始
-//   size_t length = 0;  // 数据长度
-//   for (uint32_t i=0; i<5; i++) {  // 写预聚类数据
-//     length = pairs[i].size();
-//     clusterFile.write((char*)&length, sizeof(size_t));
-//     clusterFile.write((char*)pairs[i].data(), sizeof(uint32_t)*length);
-//   }
-//   length = sizeof(uint32_t)*2+sizeof(size_t)*readsCount*2;
-//   clusterFile.seekp(length, std::ios::beg);  // 移到preCluster开始
-//   for (int32_t i=0; i<5; i++) {  // 写偏移
-//     clusterFile.write((char*)&offset, sizeof(size_t));
-//     offset += sizeof(size_t)+sizeof(uint32_t)*pairs[0].size();
-//   }
-//   clusterFile.close();
-// }
-
 
 //  r  b   s  value
 // 01 64 0.05 0.9624758607888840

@@ -3,6 +3,7 @@ makeDB.cpp
 输出文件数据内容:
   uint32_t 序列的熵 * 1
   uint32_t 序列数 * 1
+  uint32_t hash签名大小 * 1
   vector<uint32_t> 序列名长度 * readsCount
   vector<uint32_t> 序列数据长度 * readsCount
   vector<size_t> packed数据偏移 * readsCount
@@ -29,6 +30,7 @@ makeDB -f fasta文件 -p packed文件
 #include <fstream>  // fstream
 #include <vector>  // vector
 #include <unordered_map>  // unordered_map
+#include <cmath>  // pow
 #include <algorithm>  // stable_sort
 #include <omp.h>  // openmp
 #include "parser.h"  // parser
@@ -39,6 +41,7 @@ struct Option {  // 输入选项
   std::string fastaFile;  // fasta文件
   std::string packedFile;  // packed文件
   uint32_t entropy;  // 数据的熵 基因3 蛋白5
+  uint32_t signedSize;  // minHash签名大小
 };
 
 struct Read {  // 记录一条序列的位置 为了排序
@@ -54,9 +57,11 @@ void init(int argc, char **argv, Option &option) {
     Parser::Parser parser;  // 解析器
     parser.add("fasta", "-f", "fasta file", "string", "", true);  // fasta
     parser.add("packed", "-p", "packed file", "string", "", true);  // packed
+    parser.add("signed", "-s", "signed size", "int32_t", "64", false );
     if (!parser.parse(argc, argv)) exit(0);  // 解析
     option.fastaFile = parser.getString("fasta");  // fasta文件
     option.packedFile = parser.getString("packed");  // packed文件
+    option.signedSize = parser.getInt32_t("signed");  // hash签名大小
     std::cout << "fasta:\t" << option.fastaFile << "\n";
     std::cout << "packed:\t" << option.packedFile << "\n";
   }
@@ -178,9 +183,10 @@ std::unordered_map<char, uint32_t> kmerTablePro = {  // 蛋白转码表
 template <uint32_t entropy>
 inline void hashData(const std::string &read, std::vector<uint32_t> &kmers,
 std::vector<uint32_t> &hashLine) {
+  uint32_t signedSize = hashLine.size();  // hash签名大小
   {  // 生成k-mer
     kmers.assign(2048, 0);  // k-mer初始化
-    hashLine.assign(64, 0);  // hash签名初始化
+    hashLine.assign(signedSize, 0);  // hash签名初始化
     uint32_t kmer = 0;  // 生成的k-mer
     std::unordered_map<char, uint32_t> *kmerTable;  // k-mer转码矩阵
     if (entropy == 2) kmerTable = &kmerTableGen;
@@ -193,7 +199,7 @@ std::vector<uint32_t> &hashLine) {
     }
   }
   {  // 生成签名 index = (ax+a）%65536 a与65536互质 a=1,3,5,7,9...
-    for (uint32_t i=0; i<64; i++) {  // 随机排列64次
+    for (uint32_t i=0; i<signedSize; i++) {  // 随机排列 签名大小次
       uint32_t a = i*2+1;  // 随机系数
       for (uint32_t j=0; j<65536; j++) {  // 遍历kmer记录
         uint32_t index = (a*j+a)&65535;  // 生成的随机数
@@ -210,6 +216,7 @@ std::vector<uint32_t> &hashLine) {
 void makeDB(const Option &option, std::vector<Read> &reads) {
   uint32_t entropy = option.entropy;  // 熵
   uint32_t readsCount = reads.size();  // 序列数
+  uint32_t signedSize = option.signedSize;  // hash签名大小
   std::vector<size_t> inputOffsets(readsCount, 0);  // 输入文件偏移
   std::vector<size_t> packedOffsets(readsCount, 0);  // packed偏移
   std::vector<size_t> fastaOffsets(readsCount, 0);  // fasta偏移
@@ -224,13 +231,14 @@ void makeDB(const Option &option, std::vector<Read> &reads) {
     std::ofstream packedFile(option.packedFile);  // 输出文件
     packedFile.write((char*)&entropy, sizeof(uint32_t));  // 序列的熵
     packedFile.write((char*)&readsCount, sizeof(uint32_t));  // 序列数
+    packedFile.write((char*)&signedSize, sizeof(uint32_t));  // hash签名大小
     packedFile.write((char*)nameLengths.data(), sizeof(uint32_t)*readsCount);
     packedFile.write((char*)readLengths.data(), sizeof(uint32_t)*readsCount);
-    size_t offset = sizeof(uint32_t)*(2+readsCount*2);  // 当前指针
-    offset += sizeof(size_t)*readsCount*2+sizeof(uint32_t)*64*readsCount;
+    size_t offset = sizeof(uint32_t)*(3+readsCount*2);  // 当前指针
+    offset+=sizeof(size_t)*readsCount*2+sizeof(uint32_t)*signedSize*readsCount;
     for (uint32_t i=0; i<readsCount; i++) {  // packed偏移
       packedOffsets[i] = offset;
-      offset += sizeof(uint32_t)*(2+(readLengths[i]+31>>5)*option.entropy);
+      offset += sizeof(uint32_t)*(2+(readLengths[i]+31)/32*entropy);
     }
     for (uint32_t i=0; i<readsCount; i++) {  // fasta偏移
       fastaOffsets[i] = offset;
@@ -250,7 +258,7 @@ void makeDB(const Option &option, std::vector<Read> &reads) {
     std::string line="", name="", read="";  // 读入一行 序列名 序列数据
     std::vector<uint32_t> packed(0);  // 压缩数据
     std::vector<uint32_t> kmers(2048, 0);  // k-mer统计结果
-    std::vector<uint32_t> hashLine(64, 0);  // 一行哈希签名
+    std::vector<uint32_t> hashLine(signedSize, 0);  // 一行哈希签名
     #pragma omp master
     {std::cout << "pack:\t." << std::flush;}  // 打印进度
     #pragma omp for schedule (dynamic)  // 并行任务 写packed数据 生成签名
@@ -262,12 +270,12 @@ void makeDB(const Option &option, std::vector<Read> &reads) {
         getline(inputFile, line); if (line.back() == '\r') line.pop_back();
         read += line;
       }
-      if (option.entropy == 3) packData<3>(read, packed);  // 打包gene
-      if (option.entropy == 5) packData<5>(read, packed);  // 打包protein
-      if (option.entropy == 3) hashData<2>(read, kmers, hashLine);  // gene
-      if (option.entropy == 5) hashData<4>(read, kmers, hashLine);  // protein
-      size_t hashOffset = sizeof(uint32_t)*(2+readsCount*2);  // hashTable偏移
-      hashOffset += sizeof(size_t)*readsCount*2+sizeof(uint32_t)*64*i;
+      if (entropy == 3) packData<3>(read, packed);  // 打包gene
+      if (entropy == 5) packData<5>(read, packed);  // 打包protein
+      if (entropy == 3) hashData<2>(read, kmers, hashLine);  // gene
+      if (entropy == 5) hashData<4>(read, kmers, hashLine);  // protein
+      size_t hashOffset = sizeof(uint32_t)*(3+readsCount*2);  // hashTable偏移
+      hashOffset += sizeof(size_t)*readsCount*2+sizeof(uint32_t)*signedSize*i;
       hashFile.seekp(hashOffset, std::ios::beg);
       hashFile.write((char*)hashLine.data(),sizeof(uint32_t)*hashLine.size());
       packedFile.seekp(packedOffsets[i], std::ios::beg);  // 移到packed文件起始
@@ -275,7 +283,7 @@ void makeDB(const Option &option, std::vector<Read> &reads) {
       line = name+"\n"+read+"\n";
       fastaFile.seekp(fastaOffsets[i], std::ios::beg);  // 移到fasta文件起始
       fastaFile.write((char*)line.c_str(), line.size());  // 写序列
-      if ((i+1&1024*1024-1) == 0) std::cout << "." << std::flush;  // 打印进度
+      if ((i+1)%(1024*1024) == 0) std::cout << "." << std::flush;  // 打印进度
     }
     #pragma omp master
     {std::cout << " finish\n";}
