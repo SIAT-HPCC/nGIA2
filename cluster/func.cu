@@ -328,59 +328,113 @@ void clusteringFast(const Option &option, std::vector<uint32_t> &results) {
     if (0.65f<=threshold && threshold<0.87f) {row= 4; block=16;}  // 65-87
     if (0.87f<=threshold && threshold<0.97f) {row= 8; block= 8;}  // 87-97
     if (0.97f<=threshold && threshold<1.00f) {row=16; block= 4;}  // 97-99
-    // for (uint32_t i=1; i<=signedSize; i++) {
-    //   row = i;
-    //   block = signedSize/row;
-    //   if (1.0f-pow(1.0f-pow(threshold, row), block) < 0.95f) break;
-    // }
-    // row -= 1;
-    // block = signedSize/row;
     std::cout << "hash row:\t" << row << "\n";
     std::cout << "hash blk:\t" << block << "\n";
     cudaMallocManaged(&cluster, sizeof(uint32_t)*readsCount);  // 聚类结果
     memset(cluster, 0xFF, sizeof(uint32_t)*readsCount);  // 0xFFFFFFFF是未聚类的
     cudaMallocManaged(&jobs, sizeof(uint32_t)*readsCount*2);  // 剩余序列
     memset(jobs, 0, sizeof(uint32_t)*readsCount*2);  // 最初没有任务
+
+// minHash算法的核心
     uint32_t jobCount = 0;  // 任务数是0
-    std::unordered_map<std::string, std::vector<uint32_t>> preClusters;  // 预聚
+    std::unordered_map<std::string, uint32_t> preClusters(0);  // 预聚类
     std::cout << "clustering:\n";  // 开始聚类
     for (uint32_t b=0; b<block; b++) {  // 遍历hashTable的block
       std::cout << "\r" << b+1 << "/" << block << std::flush;
       preClusters.clear();  // 预聚类结果
       std::string signedName = "";  // 签名
+      jobCount = 0;
       for (uint32_t i=0; i<readsCount; i++) {  // 遍历所有序列的签名
+        if (cluster[i]!=0xFFFFFFFF && cluster[i]!=i) continue;  // 已经聚类了
         signedName.clear();  // 清空
         for (uint32_t r=b*row; r<b*row+row; r++) {  // block中的多row生成签名
           signedName += std::to_string(hashTable[i*64+r])+" ";
         }
         const auto &iterator = preClusters.find(signedName);  // 查找签名
         if (iterator == preClusters.end()) {  // 没找到签名就添加记录
-          preClusters[signedName] = std::vector<uint32_t>{i};
+          preClusters[signedName] = i;
         } else {  // 找到签名就添加序列
-          iterator->second.push_back(i);
-        }
-      }
-      jobCount = 0;
-      for (const auto iterator:preClusters) {  // 遍历签名记录 分配比对任务
-        if (iterator.second.size() == 1) continue;  // 孤狼序列不比对
-        uint32_t rep = iterator.second[0];  // 代表序列
-        if (cluster[rep] == 0xFFFFFFFF) cluster[rep] = rep;  // 第一条序列入类
-        rep = cluster[rep];  // 代表序列相似的序列可以作为新代表序列
-        for (uint32_t j=1; j<iterator.second.size(); j++) {  // 写入任务
+          uint32_t rep = iterator->second;  // 代表序列
+          if (cluster[rep] == 0xFFFFFFFF) cluster[rep] = rep;
+          rep = cluster[rep];
           jobs[jobCount*2+0] = rep;
-          jobs[jobCount*2+1] = iterator.second[j];
+          jobs[jobCount*2+1] = i;
           jobCount += 1;
         }
       }
       // 序列比对
-      cudaDeviceSynchronize();  // 同步数据
+      cudaMemPrefetchAsync(cluster, sizeof(uint32_t)*jobCount, 0);  // toGPU
+      cudaMemPrefetchAsync(jobs, sizeof(uint32_t)*jobCount*2, 0);  // toGPU
       if (entropy == 3) kernel_dynamic1<3, 5><<<(jobCount+63)>>6, 64>>>
         (reads, offsets, jobs, jobCount, cluster, threshold);  // 基因
       if (entropy == 5) kernel_dynamic1<5, 23><<<(jobCount+63)>>6, 64>>>
         (reads, offsets, jobs, jobCount, cluster, threshold);  // 蛋白
-      cudaDeviceSynchronize();  // 同步数据
+      cudaMemPrefetchAsync(cluster, sizeof(uint32_t)*readsCount,
+        cudaCpuDeviceId, 0);  // toHost
+      cudaStreamSynchronize(0);  // 等数据传输完成
     }
     std::cout << "\r" << block << "/" << block << "\n";
+
+
+// 用数组排序的版本 排序太耗时
+// Timer::Timer timer01;
+// Timer::Timer timer02; timer02.pause();
+// Timer::Timer timer03; timer03.pause();
+//     uint32_t jobCount = 0;  // 任务数是0
+//     std::vector<std::vector<uint32_t>> preClusters(0);  // 预聚类
+//     preClusters.assign(readsCount, std::vector<uint32_t>(row+1, 0));  // 初始化
+//     std::cout << "clustering:\n";  // 开始聚类
+//     for (uint32_t b=0; b<block; b++) {  // 遍历hashTable的block
+//       std::cout << "\r" << b+1 << "/" << block << "\n";
+//       for (uint32_t i=0; i<readsCount; i++) {  // 遍历所有序列的签名
+//         for (uint32_t r=0; r<row; r++) {  // block中的多row生成签名
+//           preClusters[i][r] = hashTable[i*signedSize+b*row+r];
+//         }
+//         preClusters[i][row] = i;  // 序列的编号
+//       }
+// timer02.resume();
+//       std::stable_sort(preClusters.begin(), preClusters.end(), []
+//       (const std::vector<uint32_t> &a, const std::vector<uint32_t> &b) {
+//         for (uint32_t j=0; j<a.size()-1; j++)
+//           if(a[j] != b[j]) return a[j] > b[j];
+//         return false;  // 都相同 返回false
+//       });  // 稳定排序
+// timer02.pause();
+//       jobCount = 0;
+//       uint32_t *represent = &preClusters[0][0];  // 代表序列的记录
+//       for (uint32_t j=1; j<readsCount; j++) {
+//         bool isSame = true;  // 两序列是否相等
+//         for(uint32_t k=0; k<row; k++) isSame &= represent[k]==preClusters[j][k];
+//         if (isSame) {  // 找到相同签名序列
+//           uint32_t rep = represent[row];
+//           if (cluster[rep] == 0xFFFFFFFF) cluster[rep] = rep;
+//           rep = cluster[rep];
+//           jobs[jobCount*2+0] = rep;
+//           jobs[jobCount*2+1] = preClusters[j][row];
+//           jobCount += 1;
+//         } else {  // 没找到相同签名序列
+//           represent = &preClusters[j][0];
+//         }
+//       }
+// std::cout << "job count:\t" << jobCount << "\n";
+// timer03.resume();
+//       // 序列比对
+//       cudaMemPrefetchAsync(jobs, sizeof(uint32_t)*jobCount*2, 0);  // toGPU
+//       if (entropy == 3) kernel_dynamic1<3, 5><<<(jobCount+63)>>6, 64>>>
+//         (reads, offsets, jobs, jobCount, cluster, threshold);  // 基因
+//       if (entropy == 5) kernel_dynamic1<5, 23><<<(jobCount+63)>>6, 64>>>
+//         (reads, offsets, jobs, jobCount, cluster, threshold);  // 蛋白
+//       cudaMemPrefetchAsync(cluster, sizeof(uint32_t)*readsCount,
+//         cudaCpuDeviceId, 0);  // toHost
+//       cudaStreamSynchronize(0);  // 等数据传输完成
+// timer03.pause();
+//     }
+//     std::cout << "\r" << block << "/" << block << "\n";
+// std::cout << "whole time:\t"; timer01.getDuration();
+// std::cout << "sort  time:\t"; timer02.getDuration();
+// std::cout << "align time:\t"; timer03.getDuration();
+
+
   }  // 聚类过程end
   {  // 生成结果start
     for (uint32_t i=0; i<readsCount; i++) {  // 代表序列重新写为0xFFFFFFFF
@@ -398,7 +452,6 @@ void clusteringFast(const Option &option, std::vector<uint32_t> &results) {
 
 // countResult 统计结果
 void conutResult(const Option &option, const std::vector<uint32_t> &results) {
-  Timer::Timer timerWhol;
   uint32_t readsCount = results.size();  // 序列数
   std::vector<uint64_t> orders(readsCount, 0);  // 前32bit代表序列 后32bit任务序列
   {  // 计算结果文件的写入顺序
@@ -465,7 +518,6 @@ void conutResult(const Option &option, const std::vector<uint32_t> &results) {
     fastaFile.close();
     resultFile.close();
   }
-  std::cout << "总体耗时:\t"; timerWhol.getDuration();
 }
 
 // 优化
