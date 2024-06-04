@@ -489,6 +489,7 @@ void conutResult(const Option &option, const std::vector<uint32_t> &results) {
     fastaFile.close();
     std::cout << "cluster:\t" << count << "\n";
   }
+  std::ofstream(option.resultFile).close();  // 先清空输出文件
   #pragma omp parallel num_threads(6)  // 固态硬盘 线程刚好足够
   {  // 写入结果文件
     std::ifstream fastaFile(option.packedFile);  // 输入
