@@ -172,7 +172,7 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
     std::cout << "longest:\t" << reads[0] << "\n";         // 长
     std::cout << "shortest:\t" << reads[offsets[readsCount - 1]] << "\n"; // 短
   }
-  uint32_t row = 1, block = 64;                      // minHash算法的b和r
+  uint32_t row = 1, block = 128;                      // minHash算法的b和r
   float threshold = (float)option.identity / 100.0f; // 相似度阈值
   {                                                  // 处理hashTable
     if (0.45f < threshold && threshold <= 0.77f) {   // 计算row和block
