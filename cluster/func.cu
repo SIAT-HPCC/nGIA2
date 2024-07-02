@@ -261,11 +261,11 @@ void saveResult(const Option &option, const std::vector<uint32_t> &results) {
     }
     std::stable_sort(orders.begin(), orders.end()); // 排序
   }
+  std::vector<uint32_t> nameLengths(readsCount, 0); // 序列名长度
+  std::vector<uint32_t> readLengths(readsCount, 0); // 序列长度
   std::vector<size_t> fastaOffsets(readsCount, 0);  // 输入文件的偏移
   std::vector<size_t> resultOffsets(readsCount, 0); // 结果文件的偏移
   { // 计算结果文件的偏移
-    std::vector<uint32_t> nameLengths(readsCount, 0);     // 序列名长度
-    std::vector<uint32_t> readLengths(readsCount, 0);     // 序列长度
     std::ifstream fastaFile(option.packedFile);           // 输入文件
     fastaFile.seekg(sizeof(uint32_t) * 3, std::ios::beg); // 跳到长度位置
     fastaFile.read((char *)nameLengths.data(), sizeof(uint32_t) * readsCount);
@@ -289,22 +289,22 @@ void saveResult(const Option &option, const std::vector<uint32_t> &results) {
     std::cout << "cluster:\t" << count << "\n";
   }
   std::ofstream(option.resultFile).close(); // 先清空输出文件
-#pragma omp parallel
+#pragma omp parallel num_threads(8) // 8线程足够 性能稳定
   {                                             // 写入结果文件
     std::ifstream fastaFile(option.packedFile); // 输入
     std::ofstream resultFile(option.resultFile, std::ios::in); // 输出
     std::string name = "", read = ""; // 序列名 序列数据
 #pragma omp master
     { std::cout << "save:\t." << std::flush; } // 打印进度
-#pragma omp for
+#pragma omp for schedule(static, 8)
     for (uint32_t i = 0; i < readsCount; i++) {          // 写入结果
       uint32_t rep = (orders[i] >> 32) & 0xFFFFFFFF;     // 代表序列
       uint32_t job = orders[i] & 0xFFFFFFFF;             // 任务序列
       fastaFile.seekg(fastaOffsets[job], std::ios::beg); // 跳到输入开始
-      getline(fastaFile, name);
-      name += "\n"; // 读序列名
-      getline(fastaFile, read);
-      read += "\n";                                        // 读序列数据
+      name.resize(nameLengths[job]+1);                   // 序列名
+      fastaFile.read((char*)name.data(), nameLengths[job]+1);
+      read.resize(readLengths[job]+1);                   // 序列数据
+      fastaFile.read((char*)read.data(), readLengths[job]+1);
       resultFile.seekp(resultOffsets[job], std::ios::beg); // 跳到输出开始
       if (rep == job) {                                    // 代表序列
         resultFile.write((char *)name.data(), name.size());
