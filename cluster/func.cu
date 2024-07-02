@@ -49,8 +49,10 @@ void init(int argc, char **argv, Option &option) {
   }
   {                      // 配置显卡 export CUDA_VISIBLE_DEVICES=0 指定GPU
     cudaDeviceProp prop; // 显卡属性
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) { // 找不到显卡 退出
+    if (cudaGetDeviceProperties(&prop, 1) != cudaSuccess) { // 找不到显卡 退出
       std::cout << "find no GPU \n";
+      auto err = cudaGetLastError(); // 报错信息
+      std::cout << cudaGetErrorString(err) << "\n";
       exit(0);
     }
     cudaSetDevice(0);
