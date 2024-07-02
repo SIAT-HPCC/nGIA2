@@ -9,6 +9,7 @@ struct Option {           // 输入参数
   std::string packedFile; // packed文件
   std::string resultFile; // result文件
   uint32_t identity;      // identity
+  uint32_t loopCount;     // 循环次数
 };
 
 //--------声明函数--------//

@@ -347,18 +347,43 @@ void packData(const Option &option, std::vector<Read> &reads,
 
 // groupSequence 序列分组
 void groupSequence(const Option &option, std::vector<uint32_t> &hashTable) {
-  uint32_t readsCount = hashTable.size() / SIGNEDCOUNT;  // 序列数
-  std::ofstream hashFile(option.packedFile, std::ios::in); // 输出hashTable
-  size_t hashOffset = sizeof(uint32_t) * (3 + readsCount * 2) +
-                      sizeof(size_t) * readsCount * 2; // hashTable偏移
-  hashFile.seekp(hashOffset, std::ios::beg);
-  hashFile.write((char *)hashTable.data(), sizeof(uint32_t) * hashTable.size());
-  hashFile.close();
-
-#pragma omp parallel
-  {  // 序列分组
-    //
+  const uint32_t readsCount = hashTable.size() / SIGNEDCOUNT;    // 序列数
+  std::vector<uint32_t> groupFinal(readsCount * SIGNEDCOUNT, 0); // 分组结果
+  std::cout << "group:\t." << std::flush;                        // 打印进度
+#pragma omp parallel num_threads(SIGNEDCOUNT)
+  { // 分组
+  uint64_t count = 0;                                            // 进度
+    // 计算相同kmer
+    const uint32_t order = omp_get_thread_num(); // 顺序 0-127
+    std::unordered_map<uint32_t, std::vector<uint32_t>> groups(0); // 分组
+    for (uint32_t i = 0; i < readsCount; i++) { // 遍历所有序列的签名
+      const uint32_t kmer = hashTable[i * SIGNEDCOUNT + order]; // k-emr
+      const auto &iterator = groups.find(kmer);                 // 查找
+      if (iterator == groups.end()) { // 没找到签名就添加记录
+        groups[kmer] = {i + 0x80000000};
+      } else { // 找到了就添加序列
+        iterator->second.push_back(i);
+      }
+        count += 1;
+        #pragma omp master
+        if (count % (1024 * 1024) == 0) { // 打印进度
+          std::cout << "." << std::flush;
+        }
+    }
+    uint32_t *groupResult = groupFinal.data() + order * readsCount; // 开始位置
+    for (const auto &[key, value] : groups) { // 拷贝结果
+      std::memcpy(groupResult, value.data(), sizeof(uint32_t) * value.size());
+      groupResult += value.size();
+    }
   }
+  std::cout << " finish\n";
+  std::ofstream groupFile(option.packedFile, std::ios::in); // 输出hashTable
+  size_t groupOffset = sizeof(uint32_t) * (3 + readsCount * 2) +
+                       sizeof(size_t) * readsCount * 2; // hashTable偏移
+  groupFile.seekp(groupOffset, std::ios::beg);
+  groupFile.write((char *)groupFinal.data(),
+                  sizeof(uint32_t) * groupFinal.size());
+  groupFile.close();
 }
 
 //--------主函数--------//
@@ -374,21 +399,3 @@ int main(int argc, char **argv) {
   timer.getDuration();                // 结束计时
   timer.getTimeNow();                 // 时间戳
 }
-
-// 输出文件数据内容:
-//   uint32_t 序列的熵 * 1
-//   uint32_t 序列数 * 1
-//   uint32_t hash签名数 * 1
-//   vector<uint32_t> 序列名长度 * readsCount
-//   vector<uint32_t> 序列数据长度 * readsCount
-//   vector<size_t> packed数据偏移 * readsCount
-//   vector<size_t> fasta数据偏移 * readsCount
-//   hashTable数据
-//     uint32_t hash签名 * readsCount*hash签名数
-//   packed数据 (序列数条记录)
-//     uint32_t 数据长度 * 1
-//     uint32_t 净长度 * 1
-//     uint32_t 压缩数据 * (数据长度+31)/32*熵
-//   fasta数据 (序列数条记录)
-//     string 序列名 * 1
-//     string 序列 * 1

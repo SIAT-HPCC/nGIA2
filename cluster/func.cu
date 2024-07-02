@@ -4,7 +4,6 @@
 // 很多冗余优化 是为减少不可预期的编译行为 减小耗时波动
 #include "func.h"        // 数据结构与函数
 #include "parser.h"      // 解析器
-#include "timer.h"       // timer
 #include <algorithm>     // stable_sort
 #include <fstream>       // fstream
 #include <iostream>      // cout
@@ -19,12 +18,14 @@ void init(int argc, char **argv, Option &option) {
     parser.add("packed", "-p", "packed file", "string", "", true);
     parser.add("result", "-r", "result file", "string", "", true);
     parser.add("identity", "-i", "identity 1-99", "int32_t", "", true);
+    parser.add("loop", "-l", "loop count 64-128", "int32_t", "64", false);
     if (!parser.parse(argc, argv)) { // 解析失败 退出
       exit(0);
     }
     option.packedFile = parser.getString("packed");  // packed文件
     option.resultFile = parser.getString("result");  // result文件
     option.identity = parser.getInt32_t("identity"); // 相似度
+    option.loopCount = parser.getInt32_t("loop");    // 循环次数
   }
   {                                              // 校验参数
     std::ifstream packedFile(option.packedFile); // packed文件
@@ -40,6 +41,11 @@ void init(int argc, char **argv, Option &option) {
       exit(0);
     }
     std::cout << "identity:\t" << option.identity << "\n"; // 打印信息
+    if (option.loopCount < 64 || 128 < option.loopCount) {
+      std::cout << "loop count should be 64-128\n";
+      exit(0);
+    }
+    std::cout << "loop count:\t" << option.loopCount << "\n"; // 打印信息
   }
   {                      // 配置显卡 export CUDA_VISIBLE_DEVICES=0 指定GPU
     cudaDeviceProp prop; // 显卡属性
@@ -63,10 +69,11 @@ __global__ void __launch_bounds__(64, 1)      // maxThread/block, minBlock/SM
                    const uint32_t jobCount, uint32_t *cluster,
                    const float threshold) {
   uint32_t index = blockDim.x * blockIdx.x + threadIdx.x; // 线程编号
-  if (index >= jobCount)
+  if (index >= jobCount) {                                // 超出范围
     return;
-  uint32_t *represent = &reads[offsets[jobs[index * 2 + 0]]]; // 代表序列
-  uint32_t *read = &reads[offsets[jobs[index * 2 + 1]]];      // 任务序列
+  }
+  __restrict__ uint32_t *represent = &reads[offsets[jobs[index * 2 + 0]]];
+  __restrict__ uint32_t *read = &reads[offsets[jobs[index * 2 + 1]]];
   uint32_t length1 = represent[0];    // 代表序列长度
   uint32_t length2 = read[0];         // 剩余序列长度
   uint32_t netLength1 = represent[1]; // 代表序列净长度
@@ -129,13 +136,13 @@ __global__ void __launch_bounds__(64, 1)      // maxThread/block, minBlock/SM
   }
 }
 
-// clusteringFast 利用局部敏感哈希快速聚类
+// clustering 利用局部敏感哈希快速聚类
 void clustering(const Option &option, std::vector<uint32_t> &results) {
   uint32_t entropy = 0;                                      // 数据的熵
   uint32_t readsCount = 0;                                   // 序列数
   uint32_t signedCount = 0;                                  // 签名尺寸
   std::vector<uint32_t> readLengths(0);                      // 序列长度
-  std::vector<uint32_t> hashTable(0);                        // hashTable
+  std::vector<uint32_t> preGroup(0);                         // 预分组
   size_t *offsets = NULL;                                    // 序列偏移
   uint32_t *reads = NULL;                                    // 序列数据
   {                                                          // 读数据
@@ -150,12 +157,12 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
     cudaMemAdvise(offsets, sizeof(size_t) * (readsCount + 1),
                   cudaMemAdviseSetReadMostly, 0); // 只读不写
     packedFile.read((char *)offsets, sizeof(size_t) * (readsCount + 1)); // 偏移
-    hashTable.assign(readsCount * signedCount, 0);               // hashTable
-    size_t hashOffset = sizeof(uint32_t) * (3 + readsCount * 2); // hash位置
-    hashOffset += sizeof(size_t) * readsCount * 2;
-    packedFile.seekg(hashOffset, std::ios::beg); // 移到hashTable处
-    packedFile.read((char *)hashTable.data(),
-                    sizeof(uint32_t) * hashTable.size());
+    preGroup.assign(readsCount * signedCount, 0);                 // 预聚类
+    size_t groupOffset = sizeof(uint32_t) * (3 + readsCount * 2); // hash位置
+    groupOffset += sizeof(size_t) * readsCount * 2;
+    packedFile.seekg(groupOffset, std::ios::beg); // 移到hashTable处
+    packedFile.read((char *)preGroup.data(),
+                    sizeof(uint32_t) * preGroup.size());         // 预聚类
     cudaMallocManaged(&reads, offsets[readsCount] - offsets[0]); // 打包数据
     cudaMemAdvise(reads, offsets[readsCount] - offsets[0],
                   cudaMemAdviseSetReadMostly, 0); // 建议 只读不写
@@ -172,55 +179,36 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
     std::cout << "longest:\t" << reads[0] << "\n";         // 长
     std::cout << "shortest:\t" << reads[offsets[readsCount - 1]] << "\n"; // 短
   }
-  uint32_t row = 1, block = 128;                      // minHash算法的b和r
   float threshold = (float)option.identity / 100.0f; // 相似度阈值
-  {                                                  // 处理hashTable
-    if (0.45f < threshold && threshold <= 0.77f) {   // 计算row和block
-      row = 2;
-      block = 32;
-    } else if (0.77f < threshold && threshold <= 0.94f) {
-      row = 4;
-      block = 16;
-    } else if (0.94f < threshold) {
-      row = 8;
-      block = 8;
-    }
-  }
-  uint32_t *cluster = NULL; // 聚类结果
-  uint32_t *jobs = NULL;    // 比对任务
-  { // 聚类过程start
-    std::cout << "hash row:\t" << row << "\n";
-    std::cout << "hash blk:\t" << block << "\n";
+  uint32_t loopCount = option.loopCount;             // 循环分组次数
+  uint32_t *cluster = NULL;                          // 聚类结果
+  uint32_t *jobs = NULL;                             // 比对任务
+  {                                                  // 聚类过程start
     cudaMallocManaged(&cluster, sizeof(uint32_t) * readsCount); // 聚类结果
     memset(cluster, 0xFF, sizeof(uint32_t) * readsCount); // 最大值未聚类
     cudaMallocManaged(&jobs, sizeof(uint32_t) * readsCount * 2); // 剩余序列
     memset(jobs, 0, sizeof(uint32_t) * readsCount * 2); // 最初没有任务
     // minHash算法的核心
-    uint32_t jobCount = 0;                                    // 任务数是0
-    std::unordered_map<std::string, uint32_t> preClusters(0); // 预聚类
-    std::cout << "clustering:\n";                             // 开始聚类
-    for (uint32_t b = 0; b < block; b++) { // 遍历hashTable的block
-      std::cout << "\r" << b + 1 << "/" << block << std::flush;
-      preClusters.clear(); // 清空预聚类结果
+    uint32_t jobCount = 0;                              // 任务数是0
+    std::cout << "clustering:\n";                       // 开始聚类
+    bool jobActive = false;                             // 激活任务
+    for (uint32_t loop = 0; loop < loopCount; loop++) { // 重复分组比对过程
+      std::cout << "\r" << loop + 1 << "/" << loopCount << std::flush;
       jobCount = 0;
+      uint32_t *preGroupLoop = preGroup.data() + loop * readsCount; // 当前循环
+      uint32_t rep = 0, job = 0;                  // 代表序列 任务序列
       for (uint32_t i = 0; i < readsCount; i++) { // 遍历所有序列的签名
-        std::string signedName = "";              // 签名
-        for (uint32_t r = b * row; r < b * row + row; r++) { // 生成签名
-          signedName += std::to_string(hashTable[i * signedCount + r]) + " ";
-        }
-        const auto &iterator = preClusters.find(signedName); // 查找签名
-        if (iterator == preClusters.end()) { // 没找到签名就添加记录
-          preClusters[signedName] = i;
-        }
-        if (iterator != preClusters.end() &&
-            cluster[i] == 0xFFFFFFFF) { // 找到签名就添加序列
-          uint32_t rep = std::min(iterator->second, i);
-          uint32_t job = std::max(iterator->second, i);
-          if (readLengths[rep] * threshold < readLengths[job]) {
-            jobs[jobCount * 2 + 0] = rep; // 代表序列
-            jobs[jobCount * 2 + 1] = i;   // 任务序列
-            preClusters[signedName] = rep;
-            jobCount += 1;
+        if (preGroupLoop[i] >> 31 == 1) {         // 找到代表序列
+          rep = preGroupLoop[i] & 0x7FFFFFFF;
+          jobActive = true;
+        } else if (jobActive) {
+          job = preGroupLoop[i];
+          if (readLengths[rep] * threshold < readLengths[job]) { // 长度靠谱
+            jobs[jobCount * 2 + 0] = rep;                        // 代表序列
+            jobs[jobCount * 2 + 1] = job;                        // 任务序列
+            jobCount += cluster[job] == 0xFFFFFFFF; // 没聚类 任务成功
+          } else {
+            jobActive = false;
           }
         }
       }
@@ -238,16 +226,15 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
       cudaStreamSynchronize(0);                 // 等数据传输完成
     }
     std::cout << "\n";
-  } // 聚类过程end
+  }                                             // 聚类过程end
   {                                             // 生成结果start
-    for (uint32_t i = 0; i < readsCount; i++) { // 代表序列重新写为0xFFFFFFFF
+    for (uint32_t i = 0; i < readsCount; i++) { // 边缘节点 追溯代表序列
       uint32_t rep = cluster[i];
       if (rep != 0xFFFFFFFF) { // 如果不是代表序列 就追溯代表序列
         while (cluster[rep] != 0xFFFFFFFF)
           rep = cluster[rep];
       }
       cluster[i] = rep;
-      // if (cluster[i] == i) cluster[i] = 0xFFFFFFFF;
     }
     results.assign(readsCount, 0); // 聚类结果
     cudaMemcpy(results.data(), cluster, sizeof(uint32_t) * readsCount,
@@ -261,10 +248,9 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
 
 // countResult 统计结果
 void saveResult(const Option &option, const std::vector<uint32_t> &results) {
-  uint32_t readsCount = results.size(); // 序列数
-  std::vector<uint64_t> orders(readsCount,
-                               0); // 前32bit代表序列 后32bit任务序列
-  {                                // 计算结果文件的写入顺序
+  uint32_t readsCount = results.size();        // 序列数
+  std::vector<uint64_t> orders(readsCount, 0); // 32bit:32bit 代表序列:任务序列
+  { // 计算结果文件的写入顺序
     for (uint32_t i = 0; i < readsCount; i++) { // 遍历结果
       uint32_t rep = results[i];                // 记录了代表序列
       if (rep == 0xFFFFFFFF)
@@ -301,7 +287,7 @@ void saveResult(const Option &option, const std::vector<uint32_t> &results) {
     std::cout << "cluster:\t" << count << "\n";
   }
   std::ofstream(option.resultFile).close(); // 先清空输出文件
-#pragma omp parallel proc_bind(close)
+#pragma omp parallel
   {                                             // 写入结果文件
     std::ifstream fastaFile(option.packedFile); // 输入
     std::ofstream resultFile(option.resultFile, std::ios::in); // 输出
@@ -348,19 +334,9 @@ void saveResult(const Option &option, const std::vector<uint32_t> &results) {
 // 显存内计算remains
 // 少量序列用batch
 
-// gene   : 90 9392 6.43686s
-// protein: 80 5399 5.07424s
-
 // 4090的SM参数:
 // 1536个线程
 // 48个warp
 // 24个block
 // 64K个寄存器
 // 八个warp就能隐藏延迟了，四发射，64线程足够
-
-//  r  b   s  value
-// 01 64 0.05 0.9624758607888840
-// 02 32 0.30 0.9510982327503508
-// 04 16 0.65 0.9569802167317568
-// 08 08 0.87 0.9585180051096697
-// 16 04 0.97 0.9778584874251552
