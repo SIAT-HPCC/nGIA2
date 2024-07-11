@@ -2,14 +2,14 @@
 // Endian:little 默认小端
 // 为了方便 统一用uint32_t 避免有符号溢出
 // 很多冗余优化 是为减少不可预期的编译行为 减小耗时波动
-#include "func.h"        // 数据结构与函数
-#include "parser.h"      // 解析器
-#include <algorithm>     // stable_sort
-#include <fstream>       // fstream
-#include <iostream>      // cout
-#include <omp.h>         // openmp
-#include <unordered_map> // unordered_map
-#include <vector>        // vector
+#include "func.h"  // 数据结构与函数
+#include "parser.h"  // 解析器
+#include <algorithm>  // stable_sort
+#include <fstream>  // fstream
+#include <iostream>  // cout
+#include <omp.h>  // openmp
+#include <unordered_map>  // unordered_map
+#include <vector>  // vector
 
 // init 初始化 ok
 void init(int argc, char **argv, Option &option) {
@@ -18,14 +18,15 @@ void init(int argc, char **argv, Option &option) {
     parser.add("packed", "-p", "packed file", "string", "", true);
     parser.add("result", "-r", "result file", "string", "", true);
     parser.add("identity", "-i", "identity 1-99", "int32_t", "", true);
-    parser.add("loop", "-l", "loop count 64-128", "int32_t", "64", false);
+    // parser.add("loop", "-l", "loop count 64-128", "int32_t", "64", false);
     if (!parser.parse(argc, argv)) { // 解析失败 退出
       exit(0);
     }
     option.packedFile = parser.getString("packed");  // packed文件
     option.resultFile = parser.getString("result");  // result文件
     option.identity = parser.getInt32_t("identity"); // 相似度
-    option.loopCount = parser.getInt32_t("loop");    // 循环次数
+    // option.loopCount = parser.getInt32_t("loop");    // 循环次数
+    option.loopCount = 66;
   }
   {                                              // 校验参数
     std::ifstream packedFile(option.packedFile); // packed文件
@@ -193,26 +194,24 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
     // minHash算法的核心
     uint32_t jobCount = 0;                              // 任务数是0
     std::cout << "clustering:\n";                       // 开始聚类
-    bool jobActive = false;                             // 激活任务
     for (uint32_t loop = 0; loop < loopCount; loop++) { // 重复分组比对过程
       std::cout << "\r" << loop + 1 << "/" << loopCount << std::flush;
+      // 序列分组1
       jobCount = 0;
-      uint32_t *preGroupLoop = preGroup.data() + loop * readsCount; // 当前循环
-      uint32_t rep = 0, job = 0;                  // 代表序列 任务序列
+      uint32_t *preGroupLoop = preGroup.data() + loop * readsCount;  // 当前循环
+      uint32_t rep = 0, job = 0;  // 代表序列 任务序列
       for (uint32_t i = 0; i < readsCount; i++) { // 遍历所有序列的签名
-        if (preGroupLoop[i] >> 31 == 1) {         // 找到代表序列
+        if (preGroupLoop[i] > 0x7FFFFFFF) {
           rep = preGroupLoop[i] & 0x7FFFFFFF;
-          jobActive = true;
-        } else if (jobActive) {
-          job = preGroupLoop[i];
-          if (readLengths[rep] * threshold < readLengths[job]) { // 长度靠谱
-            jobs[jobCount * 2 + 0] = rep;                        // 代表序列
-            jobs[jobCount * 2 + 1] = job;                        // 任务序列
-            jobCount += cluster[job] == 0xFFFFFFFF; // 没聚类 任务成功
-          } else {
-            jobActive = false;
-          }
+          continue;
         }
+        job = preGroupLoop[i];
+        if (cluster[job] == 0xFFFFFFFF) {  // 还没聚类就聚一下
+          jobs[jobCount * 2 + 0] = rep;  // 代表序列
+          jobs[jobCount * 2 + 1] = job;  // 任务序列
+          jobCount += readLengths[rep] * threshold < readLengths[job];
+        }
+        rep = job;  // 长度与相似度同时最接近的序列
       }
       // 序列比对
       cudaMemPrefetchAsync(cluster, sizeof(uint32_t) * jobCount, 0);  // toGPU
@@ -289,14 +288,14 @@ void saveResult(const Option &option, const std::vector<uint32_t> &results) {
     std::cout << "cluster:\t" << count << "\n";
   }
   std::ofstream(option.resultFile).close(); // 先清空输出文件
-#pragma omp parallel num_threads(8) // 8线程足够 性能稳定
+  #pragma omp parallel num_threads(8) // 8线程足够
   {                                             // 写入结果文件
     std::ifstream fastaFile(option.packedFile); // 输入
     std::ofstream resultFile(option.resultFile, std::ios::in); // 输出
     std::string name = "", read = ""; // 序列名 序列数据
-#pragma omp master
+    #pragma omp master
     { std::cout << "save:\t." << std::flush; } // 打印进度
-#pragma omp for schedule(static, 8)
+    #pragma omp for schedule(static, 8)  // 16条序列足够
     for (uint32_t i = 0; i < readsCount; i++) {          // 写入结果
       uint32_t rep = (orders[i] >> 32) & 0xFFFFFFFF;     // 代表序列
       uint32_t job = orders[i] & 0xFFFFFFFF;             // 任务序列
@@ -316,7 +315,7 @@ void saveResult(const Option &option, const std::vector<uint32_t> &results) {
       if ((i + 1) % (1024 * 1024) == 0)
         std::cout << "." << std::flush; // 打印进度
     }
-#pragma omp master
+    #pragma omp master
     { std::cout << " finish\n"; }
     fastaFile.close();
     resultFile.close();

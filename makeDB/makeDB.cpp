@@ -36,7 +36,7 @@ makeDB -f fasta文件 -p packed文件
 #include <omp.h>         // openmp
 #include <unordered_map> // unordered_map
 #include <vector>        // vector
-#define SIGNEDCOUNT 128  // 签名尺寸 越大越准 速度越慢
+#define SIGNEDCOUNT 66   // 签名尺寸 越大越准 速度越慢
 
 //--------数据--------//
 struct Option {           // 输入选项
@@ -231,9 +231,10 @@ const uint32_t afArray[128] = { // 求逆 index = af*(kmer-a)%n, (af*a)%n=1
     3561711901, 2022570335, 1339173433, 2880899003, 726294901,  375292279,
     1867775825, 3271931667, 2020371533, 2977571087, 1615767785, 1101758443,
     1297640869, 43580455};
+
 template <uint32_t entropy> // 2:基因 4:蛋白
-inline void hashing(const std::string &read, uint32_t *indexs,
-                    uint32_t *hashLine) {
+inline void hashing(const std::string &read, const uint32_t mask,
+uint32_t *indexs, uint32_t *hashLine) {
   std::memset(indexs, 0xFF, sizeof(uint32_t) * SIGNEDCOUNT); // 最后一个序列
   const void *tables[5] = {0, 0, &kmerTableGen, 0, &kmerTablePro};
   std::unordered_map<char, uint32_t> *kmerTable = NULL; // k-mer转码表
@@ -242,11 +243,11 @@ inline void hashing(const std::string &read, uint32_t *indexs,
   for (uint32_t i = 0; i < read.size(); i++) {  // 遍历read
     auto iterator = (*kmerTable).find(read[i]); // 查找结果
     if (iterator != (*kmerTable).end()) {       // 找到了 碱基/氨基酸
-      kmer = ((kmer << entropy) + iterator->second) & 0xFFFFFFF; // 生成K-mer
+      kmer = ((kmer << entropy) + iterator->second) & mask; // 生成K-mer
       for (uint32_t j = 0; j < SIGNEDCOUNT; j++) { // 查找最早kmer
         const uint32_t a = aArray[j];
         const uint32_t af = afArray[j];
-        const uint32_t index = af * (kmer - a) & 0xFFFFFFF;
+        const uint32_t index = af * (kmer - a) & mask;
         hashLine[j] = index < indexs[j] ? kmer : hashLine[j]; // 更新kmer
         indexs[j] = index < indexs[j] ? index : indexs[j];    // 更新index
       }
@@ -308,6 +309,8 @@ void packData(const Option &option, std::vector<Read> &reads,
     std::string line = "", name = "", read = ""; // 读入一行 序列名 序列数据
     uint32_t packed[65536 / 32 * 5 + 2] = {0}; // 压缩数据
     uint32_t indexs[SIGNEDCOUNT] = {0};        // 哈希签名的序号
+    uint32_t mask = 0xFFFFFF;  // 短词掩码
+    while ((uint64_t)mask < (uint64_t)readsCount << 4) mask = (mask << 4) + 0xF;
 #pragma omp master
     { std::cout << "pack:\t." << std::flush; } // 打印进度
 #pragma omp for schedule(static, 5) // 并行任务 写packed数据 生成签名
@@ -321,11 +324,11 @@ void packData(const Option &option, std::vector<Read> &reads,
       }
       if (entropy == 3) { // 打包+签名 gene
         packing<3>(read, packed);
-        hashing<2>(read, indexs, &hashTable[i * SIGNEDCOUNT]);
+        hashing<2>(read, mask, indexs, &hashTable[i * SIGNEDCOUNT]);
       }
       if (entropy == 5) { // 打包+签名 protein
         packing<5>(read, packed);
-        hashing<4>(read, indexs, &hashTable[i * SIGNEDCOUNT]);
+        hashing<4>(read, mask, indexs, &hashTable[i * SIGNEDCOUNT]);
       }
       packedFile.seekp(packedOffsets[i], std::ios::beg); // 移到packed文件起始
       uint32_t length = (packed[0] + 31) / 32 * entropy + 2;
