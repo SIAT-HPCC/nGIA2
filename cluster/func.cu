@@ -2,63 +2,57 @@
 // Endian:little 默认小端
 // 为了方便 统一用uint32_t 避免有符号溢出
 // 很多冗余优化 是为减少不可预期的编译行为 减小耗时波动
-#include "func.h"  // 数据结构与函数
-#include "parser.h"  // 解析器
 #include <algorithm>  // stable_sort
 #include <fstream>  // fstream
 #include <iostream>  // cout
 #include <omp.h>  // openmp
 #include <unordered_map>  // unordered_map
 #include <vector>  // vector
+#include "func.h"  // 数据结构与函数
+#include "parser.h"  // 解析器
+
+#define SIGNEDCOUNT 66  // 签名尺寸 保证相似度0.1时 准确率大于0.99
 
 // init 初始化 ok
 void init(int argc, char **argv, Option &option) {
-  {                        // 解析命令行
-    Parser::Parser parser; // 解析器
+  {  // 解析命令行
+    Parser::Parser parser;  // 解析器
     parser.add("packed", "-p", "packed file", "string", "", true);
     parser.add("result", "-r", "result file", "string", "", true);
     parser.add("identity", "-i", "identity 1-99", "int32_t", "", true);
-    // parser.add("loop", "-l", "loop count 64-128", "int32_t", "64", false);
-    if (!parser.parse(argc, argv)) { // 解析失败 退出
-      exit(0);
-    }
+    if (!parser.parse(argc, argv)) exit(0);  // 解析失败 退出
     option.packedFile = parser.getString("packed");  // packed文件
     option.resultFile = parser.getString("result");  // result文件
-    option.identity = parser.getInt32_t("identity"); // 相似度
-    // option.loopCount = parser.getInt32_t("loop");    // 循环次数
-    option.loopCount = 66;
+    option.identity = parser.getInt32_t("identity");  // 相似度
+    option.loopCount = SIGNEDCOUNT;
   }
-  {                                              // 校验参数
-    std::ifstream packedFile(option.packedFile); // packed文件
-    if (!packedFile.is_open()) {                 // 没有输入文件 退出
+  {  // 校验参数
+    std::ifstream packedFile(option.packedFile);  // packed文件
+    if (!packedFile.is_open()) {  // 没有输入文件 退出
       std::cout << option.packedFile << " not exists\n";
       exit(0);
     }
     packedFile.close();
-    std::cout << "packed:\t\t" << option.packedFile << "\n"; // 打印信息
-    std::cout << "result:\t\t" << option.resultFile << "\n"; // 打印信息
-    if (option.identity < 1 || option.identity > 99) { // 相似度溢出 退出
+    std::cout << "packed:\t\t" << option.packedFile << "\n";  // 打印信息
+    std::cout << "result:\t\t" << option.resultFile << "\n";  // 打印信息
+    if (option.identity < 1 || option.identity > 99) {  // 相似度溢出 退出
       std::cout << "identity should be 1-99\n";
       exit(0);
     }
-    std::cout << "identity:\t" << option.identity << "\n"; // 打印信息
-    if (option.loopCount < 64 || 128 < option.loopCount) {
-      std::cout << "loop count should be 64-128\n";
-      exit(0);
-    }
-    std::cout << "loop count:\t" << option.loopCount << "\n"; // 打印信息
+    std::cout << "identity:\t" << option.identity << "\n";  // 打印信息
+    std::cout << "loop count:\t" << option.loopCount << "\n";  // 打印信息
   }
-  {                      // 配置显卡 export CUDA_VISIBLE_DEVICES=0 指定GPU
-    cudaDeviceProp prop; // 显卡属性
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) { // 找不到显卡 退出
+  {  // 配置显卡 export CUDA_VISIBLE_DEVICES=0 指定GPU
+    cudaDeviceProp prop;  // 显卡属性
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {  // 找不到显卡 退出
       std::cout << "find no GPU \n";
-      auto err = cudaGetLastError(); // 报错信息
+      auto err = cudaGetLastError();  // 报错信息
       std::cout << cudaGetErrorString(err) << "\n";
       exit(0);
     }
     cudaSetDevice(0);
-    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1); // 共享内存 缓存优先
-    cudaDeviceSynchronize();                         // 激活GPU
+    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);  // 共享内存 缓存优先
+    cudaDeviceSynchronize();  // 激活GPU
     std::cout << "use GPU:\t" << prop.name << "\n";
   }
 }
@@ -66,8 +60,8 @@ void init(int argc, char **argv, Option &option) {
 // 不要改内外循环 寄存器使用会变少
 // 不要数据预取 或操作指针 用线程数掩盖延迟
 // kernel_dynamic 动态规划
-template <uint32_t entropy, uint32_t tabsize> // 熵 字母表大小
-__global__ void __launch_bounds__(64, 1)      // maxThread/block, minBlock/SM
+template <uint32_t entropy, uint32_t tabsize>  // 熵 字母表大小
+__global__ void __launch_bounds__(64, 1)  // maxThread/block, minBlock/SM
     kernel_dynamic(uint32_t *reads, size_t *offsets, uint32_t *jobs,
                    const uint32_t jobCount, uint32_t *cluster,
                    const float threshold) {
@@ -154,14 +148,14 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
     packedFile.read((char *)&readsCount, sizeof(uint32_t));  // 序列数
     packedFile.read((char *)&signedCount, sizeof(uint32_t)); // 签名尺寸
     readLengths.assign(readsCount, 0);                       // 初始化
-    packedFile.seekg(sizeof(uint32_t) * readsCount, std::ios::cur); // 跳序列名
+    packedFile.seekg(sizeof(uint32_t) * readsCount, std::ios::cur);  // 跳序列名
     packedFile.read((char *)readLengths.data(), sizeof(uint32_t) * readsCount);
-    cudaMallocManaged(&offsets, sizeof(size_t) * (readsCount + 1)); // 偏移
+    cudaMallocManaged(&offsets, sizeof(size_t) * (readsCount + 1));  // 偏移
     cudaMemAdvise(offsets, sizeof(size_t) * (readsCount + 1),
                   cudaMemAdviseSetReadMostly, 0); // 只读不写
     packedFile.read((char *)offsets, sizeof(size_t) * (readsCount + 1)); // 偏移
-    preGroup.assign(readsCount * signedCount, 0);                 // 预聚类
-    size_t groupOffset = sizeof(uint32_t) * (3 + readsCount * 2); // hash位置
+    preGroup.assign((size_t)readsCount * signedCount, 0);  // 预聚类
+    size_t groupOffset = sizeof(uint32_t) * (3 + readsCount * 2);  // hash位置
     groupOffset += sizeof(size_t) * readsCount * 2;
     packedFile.seekg(groupOffset, std::ios::beg); // 移到hashTable处
     packedFile.read((char *)preGroup.data(),
@@ -198,7 +192,7 @@ void clustering(const Option &option, std::vector<uint32_t> &results) {
       std::cout << "\r" << loop + 1 << "/" << loopCount << std::flush;
       // 序列分组1
       jobCount = 0;
-      uint32_t *preGroupLoop = preGroup.data() + loop * readsCount;  // 当前循环
+      uint32_t *preGroupLoop = preGroup.data() + (size_t)loop * readsCount;
       uint32_t rep = 0, job = 0;  // 代表序列 任务序列
       for (uint32_t i = 0; i < readsCount; i++) { // 遍历所有序列的签名
         if (preGroupLoop[i] > 0x7FFFFFFF) {
