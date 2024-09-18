@@ -23,31 +23,30 @@ nGIA2，线性运行时间的生物序列聚类软件。
 #### 使用说明
 
 1. makeDB使用说明
-usage: ./makeDB/makeDB -f <fasta> -p <packed>  ...
-option:
-  -f    fasta file (string) *
-  -p    packed file (string) *
-  * is necessary.
--f 是输入的fasta格式文件
--p 是生成的打包后的序列
-每个数据集只需要打包一次，之后任意相似度的聚类都只把打包后的数据作为输入。
-2. cluster使用说明
-usage: ./cluster/cluster -i <identity> -p <packed> -r <result>  ...
-option:
-  -i    identity 1-99 (int32_t) *
-  -p    packed file (string) *
-  -r    result file (string) *
-  * is necessary.
--i 是相似度，identity
--p 是打包后的序列
--r 是生成的结果
-3. 生成结果解释
-生成的结果类似如下：
->1
-ACGGT
-  >2
-其中：
-“>”开头的是代表序列的序列名。
-字母开头的是代表序列的碱基或氨基酸
-空格开头的是代表序列所在类内的普通序列，只给出了序列名。
-
+usage: ./makeDB/makeDB -f <fasta> -p <packed>  ...  
+option:  
+  -f    fasta file (string) *  
+  -p    packed file (string) *  
+  * is necessary.  
+-f 是输入的fasta格式文件  
+-p 是生成的打包后的序列  
+每个数据集只需要打包一次，之后任意相似度的聚类都只把打包后的数据作为输入。  
+2. cluster使用说明  
+usage: ./cluster/cluster -i <identity> -p <packed> -r <result>  ...  
+option:  
+  -i    identity 1-99 (int32_t) *  
+  -p    packed file (string) *  
+  -r    result file (string) *  
+  * is necessary.  
+-i 是相似度，identity  
+-p 是打包后的序列  
+-r 是生成的结果  
+3. 生成结果解释  
+生成的结果类似如下：  
+>1  
+ACGGT  
+  >2  
+其中：  
+“>”开头的是代表序列的序列名。  
+字母开头的是代表序列的碱基或氨基酸  
+空格开头的是代表序列所在类内的普通序列，只给出了序列名。  
