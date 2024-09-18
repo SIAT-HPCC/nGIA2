@@ -27,7 +27,7 @@ usage: ./makeDB/makeDB -f <fasta> -p <packed>  ...
 option:  
   -f    fasta file (string) *  
   -p    packed file (string) *  
-  * is necessary.  
+  \* is necessary.  
 -f 是输入的fasta格式文件  
 -p 是生成的打包后的序列  
 每个数据集只需要打包一次，之后任意相似度的聚类都只把打包后的数据作为输入。  
@@ -37,13 +37,13 @@ option:
   -i    identity 1-99 (int32_t) *  
   -p    packed file (string) *  
   -r    result file (string) *  
-  * is necessary.  
+  \* is necessary.  
 -i 是相似度，identity  
 -p 是打包后的序列  
 -r 是生成的结果  
 3. 生成结果解释  
 生成的结果类似如下：  
->1  
+\>1  
 ACGGT  
   >2  
 其中：  
