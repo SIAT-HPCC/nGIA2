@@ -1,0 +1,16 @@
+# Build outputs
+ngia2
+*.obj
+*.exe
+*.out
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
